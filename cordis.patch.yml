@@ -1,0 +1,27 @@
+# dsh bundle patch: mounts the self-contained Cline Pass provider.
+#
+# The row is host-plane: it registers an LLM provider route on the harness LLM
+# seam (so `cline-pass/*` models appear to every agent and to the model picker)
+# and registers the `cline_pass_*` management tools in the host tool registry.
+#
+# Defaults are ready to use: base URL https://api.cline.bot/api/v1, one route
+# named `cline-pass`, and the API key read from the CLINE_PASS_API_KEY
+# credential/env. Override any of it in your profile's own
+# $DSH_HOME/profiles/<name>/cordis.patch.yml, which is applied after every
+# bundle layer:
+#
+# - id: cline-pass
+#   config:
+#     apiKeyEnv: CLINE_PASS_API_KEY
+#     accounts:
+#       main:
+#         displayName: Main account
+#         apiKeyEnv: CLINE_PASS_API_KEY
+#       backup:
+#         displayName: Backup account
+#         apiKeyEnv: CLINE_PASS_BACKUP_KEY
+#     accountMode: roundrobin
+
+- insert:
+    - id: cline-pass
+      name: dsh-cline-pass

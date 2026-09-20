@@ -1,0 +1,5 @@
+node_modules/
+test/.mount-*/
+*.log
+.DS_Store
+*.tgz
