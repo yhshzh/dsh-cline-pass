@@ -47,6 +47,10 @@ const stub = {
   requests: [],
   /** which content the next successful stream carries */
   stream: 'tool-call',
+  /** when true the gateway drops the pin and serves `servedBy` instead */
+  ignorePins: false,
+  /** the channel a pin-ignoring gateway routes to */
+  servedBy: 'deepseek',
 }
 
 /** The pin a request carries, read back per pipeline. */
@@ -135,7 +139,9 @@ const gateway = createServer(async (request, response) => {
     response.writeHead(400, { 'Content-Type': 'application/json' })
     return response.end(JSON.stringify(routingError(entry.upstreams)))
   }
-  const upstream = effectiveUpstream(pin, entry.upstreams[0])
+  const upstream = stub.ignorePins === true
+    ? (stub.servedBy ?? 'deepseek')
+    : effectiveUpstream(pin, entry.upstreams[0])
   if (stub.broken.includes(upstream)) {
     response.writeHead(400, { 'Content-Type': 'application/json' })
     return response.end(JSON.stringify({ error: `invalid_request_error: upstream ${upstream} refused the pin` }))
@@ -580,6 +586,43 @@ try {
   check('pin reports what it stored', pinned.pinned.join() === 'baseten,alibaba' && pinned.sort === 'cost', JSON.stringify(pinned))
   const repinned = await call('cline_pass_pin', { model: 'cline-pass/glm-5.2', exclude: ['baseten'] })
   check('pin keeps fields it was not given', repinned.pinned.join() === 'baseten,alibaba' && repinned.excluded.join() === 'baseten', JSON.stringify(repinned))
+
+  // ── a gateway that drops the pin ──────────────────────────────────────────
+  // The live behavior this fork exists to expose: the router ignores an `only`
+  // it cannot use and answers from a channel nobody asked for, with a clean 200.
+  // Every check below fails against the unfixed code, which read that 200 as
+  // success and recorded the pinned channel as verified-available — a verdict
+  // that then fed the exclusion allow-list and hid the leak it described.
+
+  stub.ignorePins = true
+
+  const ignored = await call('cline_pass_test', { model: 'cline-pass/glm-5.2', upstreams: ['alibaba'] })
+  check('an ignored pin fails the test instead of reporting success', ignored.ok === false, JSON.stringify(ignored))
+  check('the ignored pin names the channel that actually served it', ignored.actual === 'deepseek' && ignored.adopted === false, JSON.stringify(ignored))
+  check('the ignored pin says so in the error', /ignored the pin/.test(ignored.error), ignored.error)
+
+  const violated = await call('cline_pass_test', { model: 'cline-pass/glm-5.2', upstreams: ['alibaba'], exclude: ['deepseek'] })
+  check('an excluded channel serving the request is reported as a violation', violated.ok === false && /excluded channel/.test(violated.error), violated.error)
+
+  const ignoredValidate = await call('cline_pass_validate', { model: 'cline-pass/glm-5.2' })
+  check('no channel is called available while the pin is ignored', ignoredValidate.summary.ok === 0 && ignoredValidate.summary.bad === 2, JSON.stringify(ignoredValidate.summary))
+  check('every channel carries the not-adopted verdict', ignoredValidate.results.every((row) => row.status === 'not-adopted'), JSON.stringify(ignoredValidate.results))
+
+  const ignoredStore = createStore({ historyLimit: 5 })
+  ignoredStore.learn('cline-pass/glm-5.2', { pipeline: 'planner', upstreams: ['alibaba', 'baseten'], pinnable: true })
+  const ignoredRun = adapterFor({ store: ignoredStore, pin: () => ({ upstreams: ['alibaba'], pinMode: 'strict', sort: '', exclude: [] }) })
+  stub.stream = 'tool-call'
+  await collect(ignoredRun.adapter, {
+    provider: 'cline-pass',
+    model: 'cline-pass/glm-5.2',
+    messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
+    signal: new AbortController().signal,
+  })
+  check('a stream served elsewhere does not mark the pinned channel available', !ignoredRun.learned.some((entry) => entry.status === 'ok'), JSON.stringify(ignoredRun.learned))
+  check('the stream records which channel really served it', ignoredRun.records[0]?.adherence === 'not-adopted' && ignoredRun.records[0]?.provider === 'deepseek', JSON.stringify(ignoredRun.records[0]))
+
+  stub.ignorePins = false
+
   const cleared = await call('cline_pass_pin', { model: 'cline-pass/glm-5.2', upstreams: [], exclude: [], sort: 'none' })
   check('pin can clear back to automatic', cleared.pinned.length === 0 && cleared.excluded.length === 0 && cleared.sort === '')
 
