@@ -14,6 +14,7 @@
 import {
   BUILD_TAG,
   buildAttempts,
+  channelNameFor,
   injectPrefs,
   isAdherenceOk,
   normalizePinMode,
@@ -93,6 +94,25 @@ check('an unreported channel cannot be judged', pinAdherence({ upstream: 'basete
 check('automatic routing cannot be judged', pinAdherence({ upstream: null }, routing('anything')) === 'unresolved')
 check('adherence ok covers adopted, fallback and unresolved', isAdherenceOk('adopted') && isAdherenceOk('fallback') && isAdherenceOk('unresolved'))
 check('adherence ok rejects a breach and a mismatch', !isAdherenceOk('violated') && !isAdherenceOk('not-adopted'))
+
+// ── per-pipeline channel names ───────────────────────────────────────────────
+
+// The same upstream is not the same string on both sides. OpenRouter refuses an
+// unknown provider in `provider.only` rather than ignoring it, so putting the
+// Vercel slug there can fail a request the OpenRouter slug would have served.
+check('a name is translated into the planner spelling', channelNameFor('z-ai', 'planner') === 'zai' && channelNameFor('zai', 'planner') === 'zai')
+check('a name is translated into the direct spelling', channelNameFor('zai', 'direct') === 'z-ai' && channelNameFor('z-ai', 'direct') === 'z-ai')
+check('unknown names are passed through untouched', channelNameFor('baseten', 'direct') === 'baseten' && channelNameFor('deepseek', 'planner') === 'deepseek')
+
+const aliasedPlanner = injectPrefs({ model: 'm' }, { pipeline: 'planner', upstreams: ['zai'] }, { upstream: 'zai', strict: true })
+check('the gateway spelling keeps the Vercel slug', same(aliasedPlanner.providerOptions.gateway.only, ['zai']), JSON.stringify(aliasedPlanner))
+check('the top-level spelling carries the OpenRouter slug', same(aliasedPlanner.provider.only, ['z-ai']), JSON.stringify(aliasedPlanner))
+
+const aliasedDirect = injectPrefs({ model: 'm' }, { pipeline: 'direct', upstreams: ['z-ai'] }, { upstream: 'z-ai', strict: true })
+check('a pin written in either spelling reaches both routers correctly', same(aliasedDirect.providerOptions.gateway.only, ['zai']) && same(aliasedDirect.provider.only, ['z-ai']), JSON.stringify(aliasedDirect))
+
+const aliasedExclude = injectPrefs({ model: 'm' }, { pipeline: 'planner', upstreams: ['zai', 'baseten'] }, { upstream: null, excludeList: ['zai'] })
+check('an exclusion is translated per spelling too', same(aliasedExclude.providerOptions.gateway.only, ['baseten']) && same(aliasedExclude.provider.ignore, ['z-ai']), JSON.stringify(aliasedExclude))
 
 // ── configuration warnings ───────────────────────────────────────────────────
 

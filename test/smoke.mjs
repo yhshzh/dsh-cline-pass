@@ -580,6 +580,7 @@ try {
   const tested = await call('cline_pass_test', { model: 'cline-pass/glm-5.2', upstreams: ['alibaba'] })
   check('test reports the serving upstream', tested.ok === true && tested.actual === 'alibaba', JSON.stringify(tested))
   check('test reports a single attempt', tested.trace.length === 1, JSON.stringify(tested.trace))
+  check("test surfaces the router's own account of the decision", /won tier 0/.test(tested.plan), tested.plan)
 
   const pinned = await call('cline_pass_pin', { model: 'cline-pass/glm-5.2', upstreams: ['baseten', 'alibaba'], pinMode: 'preferred', sort: 'cost' })
   check('pin persists into the settings section', same(section.perModel['cline-pass/glm-5.2'], { upstreams: ['baseten', 'alibaba'], exclude: [], pinMode: 'preferred', sort: 'cost' }), JSON.stringify(section.perModel))
@@ -621,10 +622,27 @@ try {
   check('a stream served elsewhere does not mark the pinned channel available', !ignoredRun.learned.some((entry) => entry.status === 'ok'), JSON.stringify(ignoredRun.learned))
   check('the stream records which channel really served it', ignoredRun.records[0]?.adherence === 'not-adopted' && ignoredRun.records[0]?.provider === 'deepseek', JSON.stringify(ignoredRun.records[0]))
 
+  // The channel that answered is a real channel even when the router's own pool
+  // omits it. That omission is how a model's official upstream stays invisible —
+  // and it is why an exclusion built from the pool could never cover it.
+  const ignoredProbe = await call('cline_pass_probe', { model: 'cline-pass/glm-5.2' })
+  check('a probe learns the channel that actually served it', ignoredProbe.upstreams.includes('deepseek'), JSON.stringify(ignoredProbe.upstreams))
+  check('the router pool survives alongside it', ignoredProbe.upstreams.includes('alibaba') && ignoredProbe.upstreams.includes('baseten'), JSON.stringify(ignoredProbe.upstreams))
+
   stub.ignorePins = false
+
+  const restoredProbe = await call('cline_pass_probe', { model: 'cline-pass/glm-5.2' })
+  check('an ordinary probe goes back to the router pool alone', same(restoredProbe.upstreams, ['alibaba', 'baseten']), JSON.stringify(restoredProbe.upstreams))
 
   const cleared = await call('cline_pass_pin', { model: 'cline-pass/glm-5.2', upstreams: [], exclude: [], sort: 'none' })
   check('pin can clear back to automatic', cleared.pinned.length === 0 && cleared.excluded.length === 0 && cleared.sort === '')
+
+  // With no pin there is nothing to confirm, so the render must not imply a pin
+  // failed to take effect.
+  const autoTool = tools.get('cline_pass_test')
+  const autoValue = await autoTool.execute({ model: 'cline-pass/glm-5.2' }, { signal: new AbortController().signal })
+  const autoText = autoTool.output.render({}, autoValue).map((block) => block.text).join('\n')
+  check('automatic routing does not claim a pin could not be confirmed', autoValue.targets.length === 0 && !/could not be confirmed/.test(autoText), autoText)
 
   const added = await call('cline_pass_accounts', { action: 'add', name: 'backup', key: 'sk_backup_account_9876' })
   check('add registers the account', added.accounts.length === 2 && added.accounts.some((account) => account.key === 'backup'), JSON.stringify(added.accounts))
