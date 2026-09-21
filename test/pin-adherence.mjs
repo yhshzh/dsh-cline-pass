@@ -17,6 +17,8 @@ import {
   channelNameFor,
   injectPrefs,
   isAdherenceOk,
+  MAX_UPSTREAMS,
+  mergeUpstreams,
   normalizePinMode,
   pinAdherence,
   pinWarnings,
@@ -113,6 +115,15 @@ check('a pin written in either spelling reaches both routers correctly', same(al
 
 const aliasedExclude = injectPrefs({ model: 'm' }, { pipeline: 'planner', upstreams: ['zai', 'baseten'] }, { upstream: null, excludeList: ['zai'] })
 check('an exclusion is translated per spelling too', same(aliasedExclude.providerOptions.gateway.only, ['baseten']) && same(aliasedExclude.provider.ignore, ['z-ai']), JSON.stringify(aliasedExclude))
+
+// ── the list bound ───────────────────────────────────────────────────────────
+
+// A cap below the real pool size truncates reality, and the entry most likely to
+// fall off the end is the model's own official upstream: glm-5.3-flash reported
+// exactly 25 channels — the cap, not the pool — with no `z-ai` among them.
+check('a channel list wider than 25 survives', mergeUpstreams(Array.from({ length: 30 }, (_, index) => `ch-${index}`)).length === 30)
+check('the bound clears the largest published pool', MAX_UPSTREAMS > 25, String(MAX_UPSTREAMS))
+check('merging still de-duplicates and keeps order', same(mergeUpstreams(['b', 'a'], ['a', 'c']), ['b', 'a', 'c']))
 
 // ── configuration warnings ───────────────────────────────────────────────────
 

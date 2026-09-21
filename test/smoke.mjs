@@ -627,6 +627,7 @@ try {
   // and it is why an exclusion built from the pool could never cover it.
   const ignoredProbe = await call('cline_pass_probe', { model: 'cline-pass/glm-5.2' })
   check('a probe learns the channel that actually served it', ignoredProbe.upstreams.includes('deepseek'), JSON.stringify(ignoredProbe.upstreams))
+  check('the serving channel leads the list, out of reach of any bound', ignoredProbe.upstreams[0] === 'deepseek', JSON.stringify(ignoredProbe.upstreams))
   check('the router pool survives alongside it', ignoredProbe.upstreams.includes('alibaba') && ignoredProbe.upstreams.includes('baseten'), JSON.stringify(ignoredProbe.upstreams))
 
   stub.ignorePins = false
