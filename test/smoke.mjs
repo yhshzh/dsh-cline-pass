@@ -32,6 +32,7 @@ import {
 } from '../lib/protocol.js'
 import { createStore } from '../lib/store.js'
 import { MODEL_CATALOG, REASONING_EFFORTS, resolveModelMetadata } from '../lib/catalog.js'
+import { fetchOfficialModels } from '../lib/cline.js'
 
 // ── stub gateway ────────────────────────────────────────────────────────────
 
@@ -933,6 +934,67 @@ try {
   check(`all ${Object.keys(MODEL_CATALOG).length} catalog entries resolve to valid seam metadata`, catalogProblems.length === 0, catalogProblems.join(', '))
   check('the effort list matches the gateway vocabulary exactly', REASONING_EFFORTS.map((effort) => effort.id).join(',') === 'none,minimal,low,medium,high,xhigh,max', REASONING_EFFORTS.map((effort) => effort.id).join(','))
   check('an explicit per-model effort override hides the picker', resolveModelMetadata('cline-pass', 'cline-pass/deepseek-v4.1-flash', { reasoning: false }, fallback).reasoning === undefined)
+
+  // ── a model newer than this release ────────────────────────────────────────
+  //
+  // The shipped table only knows the models that existed when this release was
+  // cut. A model published afterwards used to be adopted by id alone, so it
+  // resolved to the `text` fallback: selectable and chat-capable, but declared
+  // text-only, which makes the harness refuse its images with no explanation.
+  // The official scan now carries the modalities and caps each source publishes.
+  {
+    const newer = 'cline-pass/mimo-v2.6-pro'
+    check('a model absent from the shipped table is not in it', MODEL_CATALOG[newer] === undefined)
+    const unknown = resolveModelMetadata('cline-pass', newer, emptyOverride, fallback)
+    check('without published metadata a new model falls back to text', unknown.inputModalities.join('+') === 'text', JSON.stringify(unknown.inputModalities))
+    check('without published metadata a new model falls back to the route window', unknown.context.contextWindow === fallback.contextWindow, String(unknown.context.contextWindow))
+
+    // What models.dev publishes for it, in the shape the scan now keeps.
+    const published = { name: 'MiMo-V2.6-Pro', inputModalities: ['text', 'image', 'audio', 'video'], contextWindow: 1048576, maxTokens: 131072 }
+    const resolved = resolveModelMetadata('cline-pass', newer, emptyOverride, fallback, published)
+    check('published modalities reach a new model', resolved.inputModalities.join('+') === 'text+image', JSON.stringify(resolved.inputModalities))
+    check('published modalities are clamped to the seam vocabulary', resolved.inputModalities.every((m) => m === 'text' || m === 'image'), JSON.stringify(resolved.inputModalities))
+    check('the published context window reaches a new model', resolved.context.contextWindow === published.contextWindow, String(resolved.context.contextWindow))
+    check('the published output cap reaches a new model', resolved.defaultMaxTokens === published.maxTokens, String(resolved.defaultMaxTokens))
+    check('the published display name reaches a new model', resolved.name === published.name, resolved.name)
+
+    // The shipped table is curated, so it stays the reference for what it knows:
+    // models.dev lists audio/video/pdf the seam would reject, and a display name
+    // the provider itself does not use.
+    const curated = resolveModelMetadata('cline-pass', 'cline-pass/mimo-v2.5', emptyOverride, fallback, { inputModalities: ['text', 'image', 'audio', 'video'], name: 'Wrong' })
+    check('the shipped table wins over the published scan', curated.inputModalities.join('+') === 'text+image', JSON.stringify(curated.inputModalities))
+    check('the shipped display name wins over the published scan', curated.name === MODEL_CATALOG['cline-pass/mimo-v2.5'].name, curated.name)
+    // And an explicit override still beats both.
+    const overridden = resolveModelMetadata('cline-pass', newer, { ...emptyOverride, input: ['text'] }, fallback, published)
+    check('a configured override still wins over the published scan', overridden.inputModalities.join('+') === 'text', JSON.stringify(overridden.inputModalities))
+  }
+
+  // The scan is what supplies that metadata, so it has to keep it. It used to
+  // read the ids and drop everything else, which is how a model published after
+  // this release arrived with no modalities at all.
+  {
+    const modelsDev = {
+      'cline-pass': { models: {
+        'mimo-v2.6-pro': { name: 'MiMo-V2.6-Pro', modalities: { input: ['text', 'image', 'audio', 'video'], output: ['text'] }, limit: { context: 1048576, output: 131072 } },
+      } },
+    }
+    const scan = await fetchOfficialModels({
+      fetchImpl: async (url) => ({
+        ok: true,
+        async json() { return String(url).includes('models.dev') ? modelsDev : { clinePass: ['cline-pass/mimo-v2.6-pro', 'cline-pass/brand-new'] } },
+      }),
+    })
+    const entry = scan.catalog?.['cline-pass/mimo-v2.6-pro'] ?? {}
+    check('the scan keeps the published modalities', JSON.stringify(entry.inputModalities) === JSON.stringify(['text', 'image', 'audio', 'video']), JSON.stringify(entry.inputModalities))
+    check('the scan keeps the published context window', entry.contextWindow === 1048576, String(entry.contextWindow))
+    check('the scan keeps the published output cap', entry.maxTokens === 131072, String(entry.maxTokens))
+    check('the scan keeps the published display name', entry.name === 'MiMo-V2.6-Pro', String(entry.name))
+    // A model only the id-list source knows still counts as known, with no
+    // invented metadata: the resolver's own fallback is the one interpretation.
+    check('an id-only source still contributes membership', scan.models.includes('cline-pass/brand-new'), scan.models.join(','))
+    check('an id-only model carries no invented metadata', scan.catalog['cline-pass/brand-new'] === undefined, JSON.stringify(scan.catalog['cline-pass/brand-new']))
+    check('the scan still reports its sources', scan.sources.join(',') === 'cline.api,models.dev', scan.sources.join(','))
+  }
 
   // ── reasoning effort reaches the wire ─────────────────────────────────────
   stub.requests.length = 0
