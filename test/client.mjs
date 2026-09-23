@@ -118,17 +118,42 @@ const windowStub = {
 
 let missingRequires = []
 
-function makeRequire() {
+// The platform seed table publishes more than React; the plugin draws its
+// disclosure chevrons with the shared primitives, so the stub answers that
+// specifier too rather than recording it as a missing external.
+//
+// The icon export was renamed between host lines, so the stub below is the
+// 0.1.2–0.1.5 shape (`…Outline14`) and the postures further down cover the two
+// other shapes a host can present. `stableChevronCalls` proves this shape is
+// the one actually used, not merely tolerated.
+const PRIMITIVES_SPECIFIER = '@deepseek-ai/dsh-client-ui-primitives'
+let stableChevronCalls = 0
+const primitivesStub = {
+  IconChevronDownOutline14: () => {
+    stableChevronCalls += 1
+    return null
+  },
+}
+
+function makeRequire(primitives = primitivesStub) {
   const React = {
     createElement,
     Fragment: Symbol('Fragment'),
-    useState: (initial) => [typeof initial === 'function' ? initial() : initial, () => {}],
+    // A boolean is this panel's disclosure state: the plugin card, the account
+    // card and every model row fold with one. The stub opens them so those
+    // bodies are part of the rendered tree — a collapsed card renders its
+    // header alone, and the copy asserted below lives in the body.
+    useState: (initial) => {
+      const value = typeof initial === 'function' ? initial() : initial
+      return [value === false ? true : value, () => {}]
+    },
     useEffect: () => {},
     useMemo: (factory) => factory(),
     useRef: () => ({ current: undefined }),
   }
   return (specifier) => {
     if (specifier === 'react') return React
+    if (specifier === PRIMITIVES_SPECIFIER) return primitives
     missingRequires.push(specifier)
     throw new Error(`client-modules: require("${specifier}") missed the module table`)
   }
@@ -227,11 +252,15 @@ try {
 check('apply() runs without throwing', applyError === null, applyError?.message ?? '')
 
 const keys = registrations.map((registration) => `${registration.options.name}:${registration.options.key ?? registration.options.id ?? ''}`)
-check('every declared slot is registered', registrations.length === 3, keys.join(' '))
-check('a Settings page is registered', registrations.some((registration) => registration.options.name === 'settings.section' && registration.options.id === 'cline-pass'), keys.join(' '))
-check('a Plugins card is registered', registrations.some((registration) => registration.options.name === 'settings.plugin.item' && registration.options.key === 'cline-pass'), keys.join(' '))
+check('every declared slot is registered', registrations.length === 2, keys.join(' '))
+check('a Plugins tab is registered', registrations.some((registration) => registration.options.name === 'settings.plugins.tab' && registration.options.id === 'cline-pass'), keys.join(' '))
 check('a Models-page card is registered', registrations.some((registration) => registration.options.name === 'settings.models.provider-card' && registration.options.key === 'cline-pass'), keys.join(' '))
-check('the settings section carries a nav label thunk', typeof registrations.find((registration) => registration.options.name === 'settings.section')?.options.label === 'function')
+// `settings.plugins.tab` is a list slot ordered by `order`; the host's own
+// inventory tab sits at 10, so the route's tab is placed after it.
+check('the Plugins tab carries an order and a locale label thunk', registrations.find((registration) => registration.options.name === 'settings.plugins.tab')?.options.order === 20 && typeof registrations.find((registration) => registration.options.name === 'settings.plugins.tab')?.options.label === 'function', keys.join(' '))
+// One surface, not two: the panel lives in the Plugins tab alone, so no
+// Settings-nav entry duplicates it.
+check('no Settings page duplicates the Plugins panel', !registrations.some((registration) => registration.options.name === 'settings.section'), keys.join(' '))
 
 // ── the panel's own copy follows the active locale ──────────────────────────
 
@@ -257,27 +286,48 @@ function echoingLocale(active) {
   }
 }
 
-const sectionRegistrationForText = registrations.find((registration) => registration.options.name === 'settings.section')
+/**
+ * Expand function components so a nested body is part of the tree.
+ *
+ * `runComponent` invokes the top-level component only, and this card keeps the
+ * panel one level down (the disclosure body). Collecting text without expanding
+ * would see the card's header alone.
+ */
+function resolveComponents(node) {
+  if (node === null || node === undefined || typeof node !== 'object') return node
+  if (Array.isArray(node)) return node.map(resolveComponents)
+  if (typeof node.type === 'function') return resolveComponents(node.type(node.props))
+  return { ...node, props: { ...node.props, children: resolveComponents(node.props?.children) } }
+}
 
-function renderSectionText() {
-  return collectText(runComponent(sectionRegistrationForText.component, propsFor(sectionRegistrationForText)).tree).join(' ')
+// The Plugins tab is the one configuration surface, and it is a disclosure the
+// stub above opens, so its body — the panel — is what this renders.
+const cardRegistrationForText = registrations.find((registration) => registration.options.name === 'settings.plugins.tab')
+
+function renderCardText() {
+  return collectText(resolveComponents(runComponent(cardRegistrationForText.component, propsFor(cardRegistrationForText)).tree)).join(' ')
 }
 
 // A namespace the shared registry knows nothing about makes `locale.bind` echo
 // the key back rather than throw. The panel must still render its own copy.
+//
+// These assertions name copy that renders before any read has answered: the
+// card header and the panel's status line. The sections below the status line
+// wait for the route to be configured, so they are not part of this tree — the
+// store starts in its loading state here because effects are captured, not run.
 stubLocale = echoingLocale('zh')
-const chinese = renderSectionText()
-check('an unresolved locale lookup still renders Chinese copy', chinese.includes('尚未配置 API Key') && chinese.includes('最近请求'), chinese.slice(0, 160))
+const chinese = renderCardText()
+check('an unresolved locale lookup still renders Chinese copy', chinese.includes('尚未配置 API Key') && chinese.includes('订阅模型的渠道钉住'), chinese.slice(0, 160))
 check('no raw i18n key leaks into the rendered panel', !/\bkeyMissing\b|\bnotReady\b|\bautoSetup\b|\bhistory\b/.test(chinese), chinese.slice(0, 200))
 
 stubLocale = echoingLocale('en')
-const english = renderSectionText()
-check('an English locale renders English copy', english.includes('No API key') && english.includes('Recent requests'), english.slice(0, 160))
+const english = renderCardText()
+check('an English locale renders English copy', english.includes('No API key') && english.includes('Channel pins'), english.slice(0, 160))
 check('the two locales really differ', chinese !== english)
 
 // With no locale service at all the bundled Chinese dictionary is the default.
 stubLocale = undefined
-check('a composition without the locale service still renders Chinese', renderSectionText().includes('尚未配置 API Key'))
+check('a composition without the locale service still renders Chinese', renderCardText().includes('尚未配置 API Key'))
 
 // ── call every registered component ─────────────────────────────────────────
 
@@ -315,10 +365,74 @@ for (const registration of registrations) {
   check(`rendering ${label} registers effects without throwing`, Array.isArray(result.effects))
 }
 
+// ── the disclosure chevron across host icon sets ────────────────────────────
+//
+// The icon export was renamed between host lines: 0.1.2–0.1.5 ships
+// `IconChevronDownOutline14`, 0.1.6+ ships `…Regular` / `…Medium`. A bundle
+// that destructures one name and calls it crashes the whole panel on the other
+// host, so each posture below must still render, and the fallback must be a
+// real drawing rather than `undefined`.
+check('the 0.1.2–0.1.5 chevron export is the one used', stableChevronCalls > 0, String(stableChevronCalls))
+
+/** Render one registration under a given primitives module. */
+function renderWith(primitives, registration) {
+  const load = []
+  const win = {
+    __ModuleLoader__: { load: (e) => load.push(e) },
+    document: documentStub,
+  }
+  const previous = globalThis.window
+  globalThis.window = win
+  try {
+    const run = new Function('window', 'document', 'require', source)
+    run(win, documentStub, makeRequire(primitives))
+  } finally {
+    if (previous === undefined) delete globalThis.window
+    else globalThis.window = previous
+  }
+  const exportsUnderTest = load[0].factory(makeRequire(primitives))
+  const seen = []
+  const slots = {
+    inject: (key, callback) => { callback(); return () => {} },
+    register: (options, component) => { seen.push({ options, component }); return () => {} },
+  }
+  const ctx = {
+    logger: { info() {}, warn() {}, error() {} },
+    slots,
+    connection: connectionService,
+    effect: (body) => {
+      const dispose = body()
+      return typeof dispose === 'function' ? dispose : () => {}
+    },
+    get: (name) => (name === 'slots' ? slots : name === 'connection' ? connectionService : undefined),
+  }
+  exportsUnderTest.apply(ctx)
+  const target = seen.find((entry) => entry.options.name === registration)
+  if (target === undefined) return { tree: null, effects: [] }
+  return runComponent(target.component, propsFor(target))
+}
+
+for (const [label, primitives] of [
+  ['0.1.6+ artwork/regular/medium triple', { IconChevronDownOutlineRegular: () => null, IconChevronDownOutlineMedium: () => null }],
+  ['a seed table without any chevron icon', {}],
+]) {
+  let result = null
+  try {
+    result = renderWith(primitives, 'settings.plugins.tab')
+  } catch (error) {
+    failures.push(`rendering the Plugins tab under ${label} threw: ${error?.message ?? error}`)
+    continue
+  }
+  check(`the Plugins tab renders under ${label}`, result.tree !== null && result.tree !== undefined)
+  // The fallback is an inline <svg>; `undefined` as an element type is the
+  // crash this guards against, and JSON keeps it out of the tree entirely.
+  check(`no undefined element type leaks under ${label}`, !JSON.stringify(result.tree ?? null).includes('"type":null'), JSON.stringify(result.tree ?? null).slice(0, 120))
+}
+
 // ── the registration face is live, not a snapshot ───────────────────────────
 
-const sectionRegistration = registrations.find((registration) => registration.options.name === 'settings.section')
-const firstFace = propsFor(sectionRegistration)
+const faceRegistration = registrations.find((registration) => registration.options.name === 'settings.plugins.tab')
+const firstFace = propsFor(faceRegistration)
 check('the injected face exposes the store hook', typeof firstFace.useClinePass === 'function')
 const snapshotA = firstFace.useClinePass((value) => value)
 check('the store starts in a loading state', snapshotA.status === 'loading', JSON.stringify(snapshotA).slice(0, 80))
@@ -326,7 +440,7 @@ check('the store is uSES-safe (same reference between reads)', firstFace.useClin
 
 // The actions the panel exposes must all be callable; each one is what a
 // button in the rendered tree binds to.
-for (const name of ['refresh', 'setKey', 'testKey', 'saveAndTest', 'addAccount', 'removeAccount', 'setAccountMode', 'pinModel', 'setupModel', 'probeModel', 'validateModel', 'testModel', 'resetModel', 'refreshModels', 'loadHistory']) {
+for (const name of ['refresh', 'setKey', 'testKey', 'saveAndTest', 'addAccount', 'removeAccount', 'setAccountMode', 'setAccountEnabled', 'pinModel', 'setModelVisible', 'setModelsVisibility', 'setupModel', 'probeModel', 'validateModel', 'testModel', 'resetModel', 'refreshModels', 'loadUsage', 'loadPlan', 'loadUsageWindows', 'loadHistory']) {
   check(`the injected face exposes ${name}`, typeof firstFace[name] === 'function')
 }
 

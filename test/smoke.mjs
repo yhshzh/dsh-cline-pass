@@ -17,7 +17,7 @@
 import { createServer } from 'node:http'
 import { validateJsonSchemaValue } from '@deepseek-ai/dsh-tools'
 import { ClinePassAdapter, Config, DEFAULT_REQUEST_IMAGE_POLICY, apply, inject, name } from '../lib/index.js'
-import { buildRequestBody, reasoningOf } from '../lib/adapter.js'
+import { buildRequestBody, projectImageDimensions, reasoningOf, requestImageTarget } from '../lib/adapter.js'
 import { createEngine } from '../lib/engine.js'
 import { createPanel, PANEL_ERROR_CODE, PANEL_PATH, registerPanel } from '../lib/panel.js'
 import {
@@ -47,6 +47,10 @@ const stub = {
   requests: [],
   /** which content the next successful stream carries */
   stream: 'tool-call',
+  /** when true the gateway drops the pin and serves `servedBy` instead */
+  ignorePins: false,
+  /** the channel a pin-ignoring gateway routes to */
+  servedBy: 'deepseek',
 }
 
 /** The pin a request carries, read back per pipeline. */
@@ -135,7 +139,9 @@ const gateway = createServer(async (request, response) => {
     response.writeHead(400, { 'Content-Type': 'application/json' })
     return response.end(JSON.stringify(routingError(entry.upstreams)))
   }
-  const upstream = effectiveUpstream(pin, entry.upstreams[0])
+  const upstream = stub.ignorePins === true
+    ? (stub.servedBy ?? 'deepseek')
+    : effectiveUpstream(pin, entry.upstreams[0])
   if (stub.broken.includes(upstream)) {
     response.writeHead(400, { 'Content-Type': 'application/json' })
     return response.end(JSON.stringify({ error: `invalid_request_error: upstream ${upstream} refused the pin` }))
@@ -242,6 +248,12 @@ try {
 
   check('plugin identity', name === 'cline-pass' && same(inject, ['llm', 'tools']))
   check('config schema compiles', typeof Config === 'object' || typeof Config === 'function')
+  // From dsh 0.1.6 the settings service refuses EVERY write to an entry whose
+  // schema declares no volatile field (`volatileForm` returns undefined), which
+  // makes the panel's saves fail while its reads still work — exactly the
+  // "buttons do nothing" failure. The whole section is live: every consumer
+  // reads through the plugin's `current()` source thunk.
+  check('the config section is declared volatile so settings writes are accepted', Config.meta?.volatile === true, String(Config.meta?.volatile))
 
   const plannerPin = injectPrefs({ model: 'm' }, { pipeline: 'planner', upstreams: ['alibaba', 'baseten'] }, { upstream: 'alibaba', strict: true, sort: 'cost' })
   check('strict pin on the planner pipeline uses providerOptions.gateway.only', same(plannerPin.providerOptions, { gateway: { only: ['alibaba'], sort: 'cost' } }), JSON.stringify(plannerPin))
@@ -340,6 +352,25 @@ try {
   check('finish reports the tool-call reason', same(chunks.at(-1), { type: 'finish', reason: { kind: 'tool-calls' } }), JSON.stringify(chunks.at(-1)))
   check('the finish chunk is last', types.at(-1) === 'finish')
   check('history recorded the serving upstream', plain.records.length === 1 && plain.records[0].provider === 'alibaba', JSON.stringify(plain.records))
+  // First-chunk time is what a user waits before anything appears, and it is
+  // measured from the request's start so it can be read next to `ms`.
+  check('the successful call records when its first chunk arrived', Number.isSafeInteger(plain.records[0].ttft) && plain.records[0].ttft > 0, JSON.stringify(plain.records[0].ttft))
+  check('the first chunk never arrives after the request ends', plain.records[0].ttft <= plain.records[0].ms, `${plain.records[0].ttft} vs ${plain.records[0].ms}`)
+  // The first byte is the gateway starting to talk at all; the pair is what tells
+  // "the socket is warm while the model thinks" from "the gateway said nothing".
+  check('the successful call records when its first byte arrived', Number.isSafeInteger(plain.records[0].ttfb) && plain.records[0].ttfb > 0, JSON.stringify(plain.records[0].ttfb))
+  check('the first byte never follows the first chunk', plain.records[0].ttfb <= plain.records[0].ttft, `${plain.records[0].ttfb} vs ${plain.records[0].ttft}`)
+  // Token counts come from the usage frame, which the gateway sends last, so
+  // capturing it means reading the chunk on its way to the caller. The reasoning
+  // count is what explains a long first-chunk wait: it is thinking the caller
+  // cannot see, because this gateway does not stream it.
+  check('the successful call records its token usage', plain.records[0].usage?.inputTokens === 8 && plain.records[0].usage?.outputTokens === 5, JSON.stringify(plain.records[0].usage))
+  // The cache count is present in this frame; the reasoning count is optional —
+  // `mapUsage` only carries it when the gateway reported it, so absent is a legal
+  // state and must not be read as zero reasoning.
+  check('the recorded usage carries the cache count', plain.records[0].usage?.cacheReadTokens === 2, JSON.stringify(plain.records[0].usage))
+  check('the reasoning count is either reported or absent', plain.records[0].usage?.reasoningTokens === undefined || Number.isSafeInteger(plain.records[0].usage.reasoningTokens), JSON.stringify(plain.records[0].usage))
+  check('the call records the reasoning effort it ran at', typeof plain.records[0].effort === 'string', JSON.stringify(plain.records[0].effort))
   check('the request carried the pinned model and stream flag', stub.requests.at(-1).model === 'cline-pass/glm-5.2' && stub.requests.at(-1).stream === true)
   check('the system prompt and tool schema reached the wire', stub.requests.at(-1).messages[0].role === 'system' && stub.requests.at(-1).tools[0].function.name === 'echo')
 
@@ -427,6 +458,10 @@ try {
   }
   check('every candidate failing raises one clear error', /refused the pin/.test(exhaustedError), exhaustedError)
   check('the failed call is recorded with its whole trace', exhausted.records.length === 1 && same(exhausted.records[0].attempts, ['baseten', 'alibaba']), JSON.stringify(exhausted.records))
+  // Zero is the fact "nothing ever arrived", not a missing measurement: the
+  // panel renders it as a dash rather than as an instant answer.
+  check('a call that streamed nothing records a zero first-chunk time', exhausted.records[0].ttft === 0, JSON.stringify(exhausted.records[0].ttft))
+  check('a call that never got a byte records a zero first-byte time', exhausted.records[0].ttfb === 0, JSON.stringify(exhausted.records[0].ttfb))
   stub.broken = []
 
   // ── tools through the plugin ──────────────────────────────────────────────
@@ -574,14 +609,70 @@ try {
   const tested = await call('cline_pass_test', { model: 'cline-pass/glm-5.2', upstreams: ['alibaba'] })
   check('test reports the serving upstream', tested.ok === true && tested.actual === 'alibaba', JSON.stringify(tested))
   check('test reports a single attempt', tested.trace.length === 1, JSON.stringify(tested.trace))
+  check("test surfaces the router's own account of the decision", /won tier 0/.test(tested.plan), tested.plan)
 
   const pinned = await call('cline_pass_pin', { model: 'cline-pass/glm-5.2', upstreams: ['baseten', 'alibaba'], pinMode: 'preferred', sort: 'cost' })
   check('pin persists into the settings section', same(section.perModel['cline-pass/glm-5.2'], { upstreams: ['baseten', 'alibaba'], exclude: [], pinMode: 'preferred', sort: 'cost' }), JSON.stringify(section.perModel))
   check('pin reports what it stored', pinned.pinned.join() === 'baseten,alibaba' && pinned.sort === 'cost', JSON.stringify(pinned))
   const repinned = await call('cline_pass_pin', { model: 'cline-pass/glm-5.2', exclude: ['baseten'] })
   check('pin keeps fields it was not given', repinned.pinned.join() === 'baseten,alibaba' && repinned.excluded.join() === 'baseten', JSON.stringify(repinned))
+
+  // ── a gateway that drops the pin ──────────────────────────────────────────
+  // The live behavior this fork exists to expose: the router ignores an `only`
+  // it cannot use and answers from a channel nobody asked for, with a clean 200.
+  // Every check below fails against the unfixed code, which read that 200 as
+  // success and recorded the pinned channel as verified-available — a verdict
+  // that then fed the exclusion allow-list and hid the leak it described.
+
+  stub.ignorePins = true
+
+  const ignored = await call('cline_pass_test', { model: 'cline-pass/glm-5.2', upstreams: ['alibaba'] })
+  check('an ignored pin fails the test instead of reporting success', ignored.ok === false, JSON.stringify(ignored))
+  check('the ignored pin names the channel that actually served it', ignored.actual === 'deepseek' && ignored.adopted === false, JSON.stringify(ignored))
+  check('the ignored pin says so in the error', /ignored the pin/.test(ignored.error), ignored.error)
+
+  const violated = await call('cline_pass_test', { model: 'cline-pass/glm-5.2', upstreams: ['alibaba'], exclude: ['deepseek'] })
+  check('an excluded channel serving the request is reported as a violation', violated.ok === false && /excluded channel/.test(violated.error), violated.error)
+
+  const ignoredValidate = await call('cline_pass_validate', { model: 'cline-pass/glm-5.2' })
+  check('no channel is called available while the pin is ignored', ignoredValidate.summary.ok === 0 && ignoredValidate.summary.bad === 2, JSON.stringify(ignoredValidate.summary))
+  check('every channel carries the not-adopted verdict', ignoredValidate.results.every((row) => row.status === 'not-adopted'), JSON.stringify(ignoredValidate.results))
+
+  const ignoredStore = createStore({ historyLimit: 5 })
+  ignoredStore.learn('cline-pass/glm-5.2', { pipeline: 'planner', upstreams: ['alibaba', 'baseten'], pinnable: true })
+  const ignoredRun = adapterFor({ store: ignoredStore, pin: () => ({ upstreams: ['alibaba'], pinMode: 'strict', sort: '', exclude: [] }) })
+  stub.stream = 'tool-call'
+  await collect(ignoredRun.adapter, {
+    provider: 'cline-pass',
+    model: 'cline-pass/glm-5.2',
+    messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
+    signal: new AbortController().signal,
+  })
+  check('a stream served elsewhere does not mark the pinned channel available', !ignoredRun.learned.some((entry) => entry.status === 'ok'), JSON.stringify(ignoredRun.learned))
+  check('the stream records which channel really served it', ignoredRun.records[0]?.adherence === 'not-adopted' && ignoredRun.records[0]?.provider === 'deepseek', JSON.stringify(ignoredRun.records[0]))
+
+  // The channel that answered is a real channel even when the router's own pool
+  // omits it. That omission is how a model's official upstream stays invisible —
+  // and it is why an exclusion built from the pool could never cover it.
+  const ignoredProbe = await call('cline_pass_probe', { model: 'cline-pass/glm-5.2' })
+  check('a probe learns the channel that actually served it', ignoredProbe.upstreams.includes('deepseek'), JSON.stringify(ignoredProbe.upstreams))
+  check('the serving channel leads the list, out of reach of any bound', ignoredProbe.upstreams[0] === 'deepseek', JSON.stringify(ignoredProbe.upstreams))
+  check('the router pool survives alongside it', ignoredProbe.upstreams.includes('alibaba') && ignoredProbe.upstreams.includes('baseten'), JSON.stringify(ignoredProbe.upstreams))
+
+  stub.ignorePins = false
+
+  const restoredProbe = await call('cline_pass_probe', { model: 'cline-pass/glm-5.2' })
+  check('an ordinary probe goes back to the router pool alone', same(restoredProbe.upstreams, ['alibaba', 'baseten']), JSON.stringify(restoredProbe.upstreams))
+
   const cleared = await call('cline_pass_pin', { model: 'cline-pass/glm-5.2', upstreams: [], exclude: [], sort: 'none' })
   check('pin can clear back to automatic', cleared.pinned.length === 0 && cleared.excluded.length === 0 && cleared.sort === '')
+
+  // With no pin there is nothing to confirm, so the render must not imply a pin
+  // failed to take effect.
+  const autoTool = tools.get('cline_pass_test')
+  const autoValue = await autoTool.execute({ model: 'cline-pass/glm-5.2' }, { signal: new AbortController().signal })
+  const autoText = autoTool.output.render({}, autoValue).map((block) => block.text).join('\n')
+  check('automatic routing does not claim a pin could not be confirmed', autoValue.targets.length === 0 && !/could not be confirmed/.test(autoText), autoText)
 
   const added = await call('cline_pass_accounts', { action: 'add', name: 'backup', key: 'sk_backup_account_9876' })
   check('add registers the account', added.accounts.length === 2 && added.accounts.some((account) => account.key === 'backup'), JSON.stringify(added.accounts))
@@ -604,6 +695,11 @@ try {
   const history = await call('cline_pass_history', { limit: 5 })
   check('history records the probe, validate and test calls', history.total > 0, String(history.total))
   check('history rows carry the model and latency', history.entries.every((entry) => entry.model !== '' && Number.isSafeInteger(entry.ms)))
+  // The tool hands the same latency pair the panel shows, and the render
+  // spells it as `first/total`.
+  check('history rows carry the first-chunk time', history.entries.every((entry) => Number.isSafeInteger(entry.ttft) && entry.ttft >= 0), JSON.stringify(history.entries.map((entry) => entry.ttft)))
+  const historyText = tools.get('cline_pass_history').output.render({ limit: 5 }, history).map((block) => block.text).join('\n')
+  check('the history render spells out first-chunk over total', /\d+ms\/\d+ms|—\/\d+ms/.test(historyText), historyText.slice(0, 200))
 
   // ── image input ───────────────────────────────────────────────────────────
   // The harness hands adapters durable attachment REFERENCES, never bytes, so
@@ -611,7 +707,9 @@ try {
   // OpenAI content-part form. A model that advertises image input gets the
   // blocks; the harness projects them to text for one that does not.
   const PNG_BYTES = Uint8Array.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3, 4])
-  const IMAGE_REF = { attachmentId: 'att-image-1', bytes: PNG_BYTES.length, mediaType: 'image/png' }
+  // Every durable image reference carries its own intrinsic size; the request
+  // target is derived from it, so the fixture must carry it too.
+  const IMAGE_REF = { attachmentId: 'att-image-1', bytes: PNG_BYTES.length, mediaType: 'image/png', width: 2, height: 2 }
   const attachmentStore = {
     reads: [],
     async readImageRequest(ref, policy) {
@@ -645,6 +743,13 @@ try {
   check('the base64 payload is the resolved request bytes', userParts?.[1]?.image_url.url === `data:image/png;base64,${Buffer.from(PNG_BYTES).toString('base64')}`, String(userParts?.[1]?.image_url.url))
   check('the attachment service was asked for one request version', attachmentStore.reads.length === 1 && attachmentStore.reads[0].ref.attachmentId === 'att-image-1', JSON.stringify(attachmentStore.reads.length))
   check('the request version was read at the documented image budget', attachmentStore.reads[0]?.policy?.maxBytes === DEFAULT_REQUEST_IMAGE_POLICY.maxBytes && attachmentStore.reads[0]?.policy?.maxPixels === DEFAULT_REQUEST_IMAGE_POLICY.maxPixels, JSON.stringify(attachmentStore.reads[0]?.policy))
+  // The two host lines validate opposite shapes, so the target must carry both
+  // or every image fails on one of them: 0.1.2-0.1.5 check `maxPixels`/`maxBytes`,
+  // 0.1.6+ check `width`/`height`/`maxBytes` and reject a missing `width`.
+  const imageTarget = attachmentStore.reads[0]?.policy
+  check('the request target satisfies the 0.1.2-0.1.5 contract', Number.isSafeInteger(imageTarget?.maxPixels) && imageTarget?.maxPixels > 0, JSON.stringify(imageTarget))
+  check('the request target satisfies the 0.1.6+ contract', Number.isSafeInteger(imageTarget?.width) && imageTarget?.width > 0 && Number.isSafeInteger(imageTarget?.height) && imageTarget?.height > 0, JSON.stringify(imageTarget))
+  check('the projected dimensions respect the pixel budget', imageTarget.width * imageTarget.height <= imageTarget.maxPixels, `${imageTarget.width}x${imageTarget.height} > ${imageTarget.maxPixels}`)
 
   // A text-only call must never touch the attachment service.
   attachmentStore.reads.length = 0
@@ -682,6 +787,25 @@ try {
     unresolvedError = String(error?.message ?? error)
   }
   check('an unresolved image reference is an explicit failure', /could not resolve|cannot read properties/i.test(unresolvedError), unresolvedError)
+
+  // ── request-image geometry ──────────────────────────────────────────────────
+  // The projection must be the harness's own geometry, because the older host
+  // applies exactly this and the newer one takes the value as given: if the two
+  // disagreed, the same image would render at different sizes per host.
+  const small = projectImageDimensions(800, 600, 4194304)
+  check('an image inside the budget is not resized', small.width === 800 && small.height === 600, JSON.stringify(small))
+  const huge = projectImageDimensions(6000, 4000, 4194304)
+  check('an oversized image is projected inside the budget', huge.width * huge.height <= 4194304 && huge.width > 0 && huge.height > 0, JSON.stringify(huge))
+  check('the projection preserves the aspect ratio', Math.abs((huge.width / huge.height) - 1.5) < 0.01, JSON.stringify(huge))
+  const tall = projectImageDimensions(1000, 10000, 1000000)
+  check('a tall image is projected inside the budget too', tall.width * tall.height <= 1000000 && tall.width > 0 && tall.height > 0, JSON.stringify(tall))
+  // A reference without usable dimensions cannot be turned into a target, and
+  // must fail loudly rather than sending `undefined` as a width.
+  let noSizeError = ''
+  try {
+    requestImageTarget({ attachmentId: 'att-x', mediaType: 'image/png', bytes: 4 }, DEFAULT_REQUEST_IMAGE_POLICY)
+  } catch (error) { noSizeError = String(error?.code ?? error?.message ?? error) }
+  check('a reference without dimensions is refused', /UNSUPPORTED_CONTENT/.test(noSizeError), noSizeError)
 
   check('assistant image output is refused, not dropped', (() => {
     try {
@@ -842,6 +966,15 @@ try {
   const panelHistory = await panel.history({ limit: 3 })
   check('history returns the most recent rows only', panelHistory.entries.length <= 3 && panelHistory.total > 0, JSON.stringify(panelHistory.total))
   check('history rows carry the model and latency', panelHistory.entries.every((entry) => entry.model !== '' && Number.isSafeInteger(entry.ms)))
+  // The panel projects the same rows the tool returns, both timing marks
+  // included; the two lists must not disagree about what a request cost.
+  check('the panel history carries the first-chunk time too', panelHistory.entries.every((entry) => Number.isSafeInteger(entry.ttft) && entry.ttft >= 0), JSON.stringify(panelHistory.entries.map((entry) => entry.ttft)))
+  check('the panel history carries the first-byte time too', panelHistory.entries.every((entry) => Number.isSafeInteger(entry.ttfb) && entry.ttfb >= 0), JSON.stringify(panelHistory.entries.map((entry) => entry.ttfb)))
+  // The token counts and the "was usage reported" flag have to survive the
+  // projection too, or the panel renders a dash for a call that reported usage.
+  check('the panel history carries the token counts too', panelHistory.entries.every((entry) => typeof entry.usageReported === 'boolean' && Number.isSafeInteger(entry.usage?.inputTokens ?? NaN)), JSON.stringify(panelHistory.entries.map((entry) => entry.usage)))
+  check('the panel history carries the reasoning effort too', panelHistory.entries.every((entry) => typeof entry.effort === 'string'))
+  check('a panel row never reports a later first chunk than its total', panelHistory.entries.every((entry) => entry.ttft === 0 || entry.ttft <= entry.ms))
 
   let panelRejected = ''
   try {
