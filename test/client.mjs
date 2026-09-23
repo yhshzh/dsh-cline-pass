@@ -402,6 +402,67 @@ check('a composition without the locale service still renders Chinese', renderCa
   store.set(snapshot)
 }
 
+// ── the user's path: open the tab, let the effects run, show the data ───────
+//
+// This is the sequence that shipped broken. A real mount renders with no data,
+// runs its effects to start the first read, renders again once that read lands,
+// and starts its remaining reads from there — the guard in each effect means the
+// reads only happen on the second pass. The tab's header renders fine
+// throughout, so a closed card looks healthy; the failure appears only after the
+// body mounts and its later effects run, where a throw retires the slot entry and
+// leaves an empty tabpanel rather than an error.
+{
+  const savedFetch = globalThis.fetch
+  const payload = {
+    provider: 'cline-pass', displayName: 'Cline Pass', baseURL: 'https://api.cline.bot/api/v1',
+    settingsAvailable: true, accountMode: 'single', activeAccount: 'default', ready: true,
+    accounts: [{ key: 'default', displayName: 'Cline Pass', apiKeyEnv: 'CLINE_PASS_API_KEY', enabled: true, declared: true, keyConfigured: true, keyHint: 'sk_liv…3456' }],
+    models: [{ id: 'cline-pass/glm-5.2', hidden: false, pinned: ['alibaba'], excluded: [], upstreams: ['alibaba'], upstreamStatus: [], targets: ['alibaba'] }],
+    pinnedModels: 1, hiddenModels: 0, catalogCount: 1, historySize: 1,
+    usage: { fetchedAt: Date.now(), accounts: [{ account: 'default', ok: true, limits: [{ type: 'five_hour', percentUsed: 42, resetsAt: new Date(Date.now() + 60_000).toISOString() }] }] },
+    entries: [], total: 0,
+  }
+  globalThis.fetch = async () => ({ ok: true, async json() { return { ok: true, value: payload } } })
+
+  const store = cardRegistrationForText.options.inject().hooks.clinePass
+  store.set({ status: 'loading', error: null, data: null, busy: null, notice: null, action: null })
+
+  const failures = []
+  const runEffects = () => {
+    const collected = []
+    // The stub collects into one module-level array, so drain it per pass.
+    collectedEffects.length = 0
+    runComponent(cardRegistrationForText.component, propsFor(cardRegistrationForText))
+    collected.push(...collectedEffects)
+    collectedEffects.length = 0
+    for (const effect of collected) {
+      try { effect() } catch (error) { failures.push(error?.message ?? String(error)) }
+    }
+    return collected.length
+  }
+
+  // First pass: no data yet, so only the mount read starts.
+  const firstPass = runEffects()
+  for (let tick = 0; tick < 8; tick += 1) await new Promise((resolve) => { setTimeout(resolve, 0) })
+  check('opening the tab starts a read', firstPass > 0, String(firstPass))
+
+  // Second pass: the read landed, so the remaining effects run — this is where
+  // an action the face advertises but the controller no longer defines throws.
+  const secondPass = runEffects()
+  for (let tick = 0; tick < 8; tick += 1) await new Promise((resolve) => { setTimeout(resolve, 0) })
+  check('the reads that follow the first one all run', failures.length === 0, failures.join(' | '))
+  check('the panel re-reads once its data lands', secondPass > 0, String(secondPass))
+
+  const settled = collectText(resolveComponents(runComponent(cardRegistrationForText.component, propsFor(cardRegistrationForText)).tree)).join(' ')
+  check('the panel is populated after the reads settle', settled.includes('42%') && settled.includes('cline-pass/glm-5.2'), settled.slice(0, 200))
+  check('the settled panel renders no raw i18n key', !/\bkeyMissing\b|\bpanelUnavailable\b|\bexpand\b|\bcollapse\b/.test(settled), settled.slice(0, 200))
+
+  globalThis.fetch = savedFetch
+  // The store is shared across this file, and a later assertion checks its very
+  // first state, so hand it back the way it was found.
+  store.set({ status: 'loading', error: null, data: null, busy: null, notice: null, action: null })
+}
+
 // ── call every registered component ─────────────────────────────────────────
 
 /** Build the props a slot hands a component: the injected face plus hooks. */
