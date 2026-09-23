@@ -365,6 +365,31 @@ try {
   const writtenPerModel = documents.some((text) => /perModel:/.test(text) && /gmicloud/.test(text))
   check('a panel write reaches the settings document', pinResponse.status === 200 && writtenPerModel, `${pinResponse.status} — ${documents.map((text) => text.slice(0, 160)).join(' | ')}`)
 
+  // ── removing an account actually removes it ───────────────────────────────
+  //
+  // Adding a second account and then deleting it is the only way to see whether
+  // the removal reaches the document: `settings.update` merges recursively, so a
+  // patch that simply omits the key leaves it in place — the panel reports
+  // success over HTTP and the account is still there on the next read. Both host
+  // lines merge this way, and only an `unset` edit deletes a key.
+  const readAccounts = async () => {
+    const response = await panelPost(envelope('state'), cookie)
+    return response.json?.value?.accounts ?? []
+  }
+  const added = await panelPost(envelope('account.add', { name: 'doomed', key: 'sk_doomed_key_123456' }), cookie)
+  check('the panel adds a second account', added.json?.ok === true && (await readAccounts()).some((account) => account.key === 'doomed'), `${added.status} — ${JSON.stringify((await readAccounts()).map((a) => a.key))}`)
+
+  const removed = await panelPost(envelope('account.remove', { name: 'doomed' }), cookie)
+  const remaining = await readAccounts()
+  check('a removed account is gone from the state', removed.json?.ok === true && !remaining.some((account) => account.key === 'doomed'), `${removed.status} — ${JSON.stringify(remaining.map((a) => a.key))}`)
+  // The service is the authority: re-read the document rather than trusting the
+  // panel's own projection of it.
+  const sideDocuments = [
+    join(scratch, 'settings.yaml'),
+    join(profileDir, 'cordis.patch.yml'),
+  ].filter((path) => existsSync(path)).map((path) => readFileSync(path, 'utf8'))
+  check('a removed account is gone from the settings document too', !sideDocuments.some((text) => /doomed/.test(text)), sideDocuments.map((text) => text.slice(0, 200)).join(' | '))
+
   const unknownResponse = await panelPost(envelope('nope'), cookie)
   check('an unknown action is a typed failure over the wire', unknownResponse.status === 200 && unknownResponse.json?.ok === false, `HTTP ${unknownResponse.status} — ${unknownResponse.text.slice(0, 120)}`)
 } catch (error) {

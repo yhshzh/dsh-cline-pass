@@ -182,6 +182,23 @@ function check(label, condition, detail = '') {
 
 const same = (left, right) => JSON.stringify(left) === JSON.stringify(right)
 
+/**
+ * Layer `over` onto `under` the way `dsh-settings` does.
+ *
+ * Plain objects merge recursively and everything else replaces wholesale, so a
+ * patch that omits a key leaves the stored value in place. Mirrored here so the
+ * stub below cannot accept a delete the real service would refuse.
+ */
+function mergeInto(under, over) {
+  const plain = (value) => typeof value === 'object' && value !== null && !Array.isArray(value)
+  if (!plain(under) || !plain(over)) return over
+  const merged = { ...under }
+  for (const [key, value] of Object.entries(over)) {
+    merged[key] = Object.hasOwn(merged, key) ? mergeInto(merged[key], value) : value
+  }
+  return merged
+}
+
 /** Redact a secret the way the plugin reports one (mirrors `lib/index.js`). */
 function maskKey(value) {
   const key = String(value ?? '')
@@ -504,8 +521,33 @@ try {
       hooks.setSource(() => section)
       void entry
     },
+    // The real service merges a patch recursively, and only an explicit `unset`
+    // removes a key. A stub that replaced keys wholesale made every delete look
+    // like it worked, which is how a no-op `account.remove` shipped.
     async update(_ns, patch) {
-      section = { ...section, ...patch }
+      section = mergeInto(section, patch)
+    },
+    async mutate(_ns, ops) {
+      let next = section
+      for (const op of ops) {
+        if (op.op !== 'unset' || !Array.isArray(op.path) || op.path.length === 0) continue
+        const [head, ...rest] = op.path
+        if (rest.length === 0) {
+          next = { ...next }
+          delete next[head]
+          continue
+        }
+        const walk = (node, path) => {
+          const [key, ...tail] = path
+          if (node === null || typeof node !== 'object' || !(key in node)) return node
+          const copy = { ...node }
+          if (tail.length === 0) delete copy[key]
+          else copy[key] = walk(node[key], tail)
+          return copy
+        }
+        next = { ...next, [head]: walk(next[head], rest) }
+      }
+      section = next
     },
   }
   const fakeCtx = {
