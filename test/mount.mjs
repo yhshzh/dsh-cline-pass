@@ -21,14 +21,33 @@
 import { createServer } from 'node:http'
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
+import { createRequire } from 'node:module'
 import { fileURLToPath } from 'node:url'
 import { boot, loadProfileDirectory } from '@deepseek-ai/dsh-app-boot'
 import { PANEL_PATH } from '../lib/panel.js'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const pluginDir = resolve(here, '..')
-const installAnchor = '/usr/lib/node_modules/@deepseek-ai/dsh/package.json'
-const installScope = '/usr/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai'
+// Resolve the running dsh through a package every line shares, so the harness
+// can be pointed at either supported line (install a different version into
+// this tree, or run it from a separate one) instead of assuming the
+// system-wide install. `@deepseek-ai/dsh` itself is not a dependency here, so
+// the scope is derived from the settings package that dsh-settings always has.
+const require = createRequire(import.meta.url)
+// `installScope` is the `@deepseek-ai` directory that gets symlinked into the
+// throwaway profile, so it is the parent of a resolved package.
+const installScope = dirname(dirname(require.resolve('@deepseek-ai/dsh-settings/package.json')))
+// The install anchor is the running dsh's own package.json. In a flat
+// `node_modules` layout that is a sibling of the scope; in dsh's nested layout
+// it sits one level above the scope's parent, so probe for it rather than
+// assuming either shape.
+const installAnchor = [
+  join(installScope, 'dsh', 'package.json'),
+  join(installScope, '..', '..', 'package.json'),
+].find((candidate) => {
+  if (!existsSync(candidate)) return false
+  return String(JSON.parse(readFileSync(candidate, 'utf8')).name ?? '') === '@deepseek-ai/dsh'
+})
 
 /**
  * The settings row differs between the two dsh lines this plugin supports.
@@ -130,6 +149,8 @@ ${hasSettingsFile
     config:
       path: ${JSON.stringify(join(scratch, 'credentials.yaml'))}
 
+  # Ordered as dsh-base orders them: tools injects systemPrompt, and settings
+  # injects configEditor, so each provider comes first.
   - id: system-prompt
     name: '@deepseek-ai/dsh-system-prompt'
 
@@ -334,11 +355,15 @@ try {
 
   const pinResponse = await panelPost(envelope('model.pin', { model: 'cline-pass/kimi-k3', upstreams: ['gmicloud'], pinMode: 'preferred', sort: 'ttft' }), cookie)
   // Read the written document rather than a service accessor: `settings.get`
-  // existed on 0.1.5 and is gone in 0.1.7, while the profile patch is the same
-  // file on both lines and is what "reaches the settings document" means.
-  const writtenPatch = readFileSync(join(profileDir, 'cordis.patch.yml'), 'utf8')
-  const writtenPerModel = /perModel:/.test(writtenPatch) && /gmicloud/.test(writtenPatch)
-  check('a panel write reaches the settings document', pinResponse.status === 200 && writtenPerModel, `${pinResponse.status} — ${writtenPatch.slice(0, 200)}`)
+  // existed on 0.1.5 and is gone in 0.1.7. Which file holds it differs too —
+  // 0.1.5 keeps its own settings document, 0.1.7 rewrites the profile patch —
+  // so both are searched for the value that was just written.
+  const documents = [
+    join(scratch, 'settings.yaml'),
+    join(profileDir, 'cordis.patch.yml'),
+  ].filter((path) => existsSync(path)).map((path) => readFileSync(path, 'utf8'))
+  const writtenPerModel = documents.some((text) => /perModel:/.test(text) && /gmicloud/.test(text))
+  check('a panel write reaches the settings document', pinResponse.status === 200 && writtenPerModel, `${pinResponse.status} — ${documents.map((text) => text.slice(0, 160)).join(' | ')}`)
 
   const unknownResponse = await panelPost(envelope('nope'), cookie)
   check('an unknown action is a typed failure over the wire', unknownResponse.status === 200 && unknownResponse.json?.ok === false, `HTTP ${unknownResponse.status} — ${unknownResponse.text.slice(0, 120)}`)

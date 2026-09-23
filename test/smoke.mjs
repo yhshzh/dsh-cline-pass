@@ -263,7 +263,12 @@ try {
     if (schema?.type !== 'object') return false
     return Object.values(schema.dict ?? {}).some(hasLiveField)
   }
-  check('the config writes into live fields so settings saves are accepted', hasLiveField(Config) === true, JSON.stringify(Config.meta))
+  // Only the newer line has the concept at all: schemastery 3.18.2 (0.1.5) has
+  // no `.volatile()`, and its settings service accepts writes without the
+  // declaration. Where the line does support it, at least one field must be
+  // marked or every save is rejected with "has no volatile fields".
+  const lineSupportsVolatile = typeof Config.volatile === 'function' || Config.meta?.volatile !== undefined
+  check('the config writes into live fields where the line requires it', !lineSupportsVolatile || hasLiveField(Config) === true, `${JSON.stringify(Config.meta)} volatile=${String(Config.meta?.volatile)}`)
 
   const plannerPin = injectPrefs({ model: 'm' }, { pipeline: 'planner', upstreams: ['alibaba', 'baseten'] }, { upstream: 'alibaba', strict: true, sort: 'cost' })
   check('strict pin on the planner pipeline uses providerOptions.gateway.only', same(plannerPin.providerOptions, { gateway: { only: ['alibaba'], sort: 'cost' } }), JSON.stringify(plannerPin))
