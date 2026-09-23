@@ -17,7 +17,7 @@
 import { createServer } from 'node:http'
 import { validateJsonSchemaValue } from '@deepseek-ai/dsh-tools'
 import { ClinePassAdapter, Config, DEFAULT_REQUEST_IMAGE_POLICY, apply, inject, name } from '../lib/index.js'
-import { buildRequestBody, projectImageDimensions, reasoningOf, requestImageTarget } from '../lib/adapter.js'
+import { buildRequestBody, prepareRequestImages, projectImageDimensions, reasoningOf, requestImageTarget } from '../lib/adapter.js'
 import { createEngine } from '../lib/engine.js'
 import { createPanel, PANEL_ERROR_CODE, PANEL_PATH, registerPanel } from '../lib/panel.js'
 import {
@@ -712,8 +712,8 @@ try {
   const IMAGE_REF = { attachmentId: 'att-image-1', bytes: PNG_BYTES.length, mediaType: 'image/png', width: 2, height: 2 }
   const attachmentStore = {
     reads: [],
-    async readImageRequest(ref, policy) {
-      this.reads.push({ ref, policy })
+    async readImageRequest(ref, target) {
+      this.reads.push({ ref, target })
       return { variantId: 'v1', attachment: ref, data: PNG_BYTES, mediaType: 'image/png', bytes: PNG_BYTES.length, width: 2, height: 2, depth: 'uchar', space: 'srgb', hasAlpha: false }
     },
   }
@@ -742,11 +742,11 @@ try {
   check('the image becomes an inline image_url data URI', userParts?.[1]?.type === 'image_url' && userParts[1].image_url.url.startsWith('data:image/png;base64,'), JSON.stringify(userParts?.[1]).slice(0, 80))
   check('the base64 payload is the resolved request bytes', userParts?.[1]?.image_url.url === `data:image/png;base64,${Buffer.from(PNG_BYTES).toString('base64')}`, String(userParts?.[1]?.image_url.url))
   check('the attachment service was asked for one request version', attachmentStore.reads.length === 1 && attachmentStore.reads[0].ref.attachmentId === 'att-image-1', JSON.stringify(attachmentStore.reads.length))
-  check('the request version was read at the documented image budget', attachmentStore.reads[0]?.policy?.maxBytes === DEFAULT_REQUEST_IMAGE_POLICY.maxBytes && attachmentStore.reads[0]?.policy?.maxPixels === DEFAULT_REQUEST_IMAGE_POLICY.maxPixels, JSON.stringify(attachmentStore.reads[0]?.policy))
+  check('the request version was read with target dimensions and maxBytes', Number.isSafeInteger(attachmentStore.reads[0]?.target?.width) && attachmentStore.reads[0]?.target?.width > 0 && Number.isSafeInteger(attachmentStore.reads[0]?.target?.height) && attachmentStore.reads[0]?.target?.height > 0 && attachmentStore.reads[0]?.target?.maxBytes === DEFAULT_REQUEST_IMAGE_POLICY.maxBytes, JSON.stringify(attachmentStore.reads[0]?.target))
   // The two host lines validate opposite shapes, so the target must carry both
   // or every image fails on one of them: 0.1.2-0.1.5 check `maxPixels`/`maxBytes`,
   // 0.1.6+ check `width`/`height`/`maxBytes` and reject a missing `width`.
-  const imageTarget = attachmentStore.reads[0]?.policy
+  const imageTarget = attachmentStore.reads[0]?.target
   check('the request target satisfies the 0.1.2-0.1.5 contract', Number.isSafeInteger(imageTarget?.maxPixels) && imageTarget?.maxPixels > 0, JSON.stringify(imageTarget))
   check('the request target satisfies the 0.1.6+ contract', Number.isSafeInteger(imageTarget?.width) && imageTarget?.width > 0 && Number.isSafeInteger(imageTarget?.height) && imageTarget?.height > 0, JSON.stringify(imageTarget))
   check('the projected dimensions respect the pixel budget', imageTarget.width * imageTarget.height <= imageTarget.maxPixels, `${imageTarget.width}x${imageTarget.height} > ${imageTarget.maxPixels}`)
@@ -1033,6 +1033,44 @@ try {
   check('a failure carries no Host object', rpcBadArgs.json.error.details !== undefined && JSON.stringify(rpcBadArgs.json.error.details) === '{}', JSON.stringify(rpcBadArgs.json.error.details))
   const malformed = await route.fetch(new Request(`http://localhost${PANEL_PATH}`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: 'not json' }))
   check('a malformed body is a 400, not a crash', malformed.status === 400, String(malformed.status))
+
+  // ── request image preparation & tool-result images ──────────────────────
+  let targetReceived = null
+  const dummyRef = { attachmentId: 'att-smoke-1', mediaType: 'image/png', bytes: 100, width: 1080, height: 2400 }
+  const mockAttachments = {
+    readImageRequest: async (ref, target) => {
+      targetReceived = target
+      return { attachment: ref, variantId: 'v1', mediaType: 'image/png', bytes: 20, data: Uint8Array.of(1, 2) }
+    },
+  }
+  const imgMessages = [
+    { role: 'user', content: [{ type: 'text', text: 'hi' }, { type: 'image', attachment: dummyRef }] },
+  ]
+  const prepared = await prepareRequestImages(imgMessages, mockAttachments, DEFAULT_REQUEST_IMAGE_POLICY)
+  check('prepareRequestImages projects positive integer width', Number.isSafeInteger(targetReceived?.width) && targetReceived.width > 0, String(targetReceived?.width))
+  check('prepareRequestImages projects positive integer height', Number.isSafeInteger(targetReceived?.height) && targetReceived.height > 0, String(targetReceived?.height))
+  check('prepareRequestImages includes positive integer maxBytes', Number.isSafeInteger(targetReceived?.maxBytes) && targetReceived.maxBytes > 0, String(targetReceived?.maxBytes))
+
+  const toolMessages = [
+    { role: 'user', content: [{ type: 'text', text: 'run' }] },
+    { role: 'assistant', content: [{ type: 'tool-call', id: 'call-1', name: 'read_image', arguments: '{}' }] },
+    {
+      role: 'user',
+      content: [{
+        type: 'tool-result',
+        toolCallId: 'call-1',
+        content: [{ type: 'text', text: 'read ok' }, { type: 'image', attachment: dummyRef }],
+      }],
+    },
+  ]
+  const toolPrepared = await prepareRequestImages(toolMessages, mockAttachments, DEFAULT_REQUEST_IMAGE_POLICY)
+  const toolBody = buildRequestBody({ model: 'cline-pass/deepseek-v4.1-flash', messages: toolMessages }, {}, toolPrepared)
+  const toolWire = toolBody.messages
+  const toolIndex = toolWire.findIndex(m => m.role === 'tool')
+  const imgUserIndex = toolWire.findIndex(m => m.role === 'user' && Array.isArray(m.content) && m.content.some(p => p.type === 'image_url'))
+  check('tool message is emitted', toolIndex !== -1, JSON.stringify(toolWire))
+  check('tool-result image rides a following user message', imgUserIndex > toolIndex, `tool=${toolIndex} imgUser=${imgUserIndex}`)
+  check('tool-result image has data URI url', toolWire[imgUserIndex]?.content?.some(p => p.type === 'image_url' && p.image_url?.url?.startsWith('data:image/png;base64,')), JSON.stringify(toolWire[imgUserIndex]))
 } catch (error) {
   failures.push(`unexpected failure — ${error?.stack ?? error}`)
 }
