@@ -19,16 +19,26 @@
  */
 
 import { createServer } from 'node:http'
-import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { boot, loadOptionalPatches } from '@deepseek-ai/dsh-app-boot'
+import { boot, loadProfileDirectory } from '@deepseek-ai/dsh-app-boot'
 import { PANEL_PATH } from '../lib/panel.js'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const pluginDir = resolve(here, '..')
 const installAnchor = '/usr/lib/node_modules/@deepseek-ai/dsh/package.json'
 const installScope = '/usr/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai'
+
+/**
+ * The settings row differs between the two dsh lines this plugin supports.
+ *
+ * 0.1.5 shipped `dsh-settings-file`, which carried its own `path` config; from
+ * 0.1.7 that package is gone and `dsh-settings` reads and writes the profile's
+ * own patch document, injecting `configEditor` and `profileContext`. Detecting
+ * the package rather than the version keeps this working on anything in between.
+ */
+const hasSettingsFile = existsSync(join(installScope, 'dsh-settings-file'))
 
 let passed = 0
 const failures = []
@@ -67,49 +77,79 @@ mkdirSync(scratch, { recursive: true })
 mkdirSync(join(profileDir, 'node_modules'), { recursive: true })
 symlinkSync(installScope, join(profileDir, 'node_modules', '@deepseek-ai'), 'dir')
 
-writeFileSync(join(profileDir, 'package.json'), JSON.stringify({ name: 'dsh-profile-mount-test', private: true, dsh: { profile: { bundles: [] } } }, null, 2))
+writeFileSync(join(profileDir, 'package.json'), JSON.stringify({ name: 'dsh-profile-mount-test', private: true, dsh: { profile: { bundles: ['dsh-profile-mount-test-bundle'] } } }, null, 2))
 writeFileSync(join(profileDir, 'cordis.yml'), '# composed entirely from the patch file\n[]\n')
-writeFileSync(join(profileDir, 'cordis.patch.yml'), `# The host rows this plugin needs, then the plugin itself.
+writeFileSync(join(profileDir, 'cordis.patch.yml'), `# Config overrides for the rows the bundle below mounts.
+- id: cline-pass
+  config:
+    baseURL: ${JSON.stringify(baseURL)}
+    apiKeyEnv: MOUNT_TEST_API_KEY
+    knownModels:
+      - cline-pass/glm-5.2
+      - cline-pass/kimi-k3
+${hasSettingsFile ? '' : `    accounts: {}
+    accountMode: single
+    activeAccount: ""
+    hiddenModels: []
+    models: {}
+    perModel: {}
+`}`)
+
+// A real profile gets its host rows from bundle layers, so the harness builds
+// one: the same split the shipped bundles use, with the profile patch above
+// carrying only overrides.
+const bundleDir = join(profileDir, 'node_modules', 'dsh-profile-mount-test-bundle')
+mkdirSync(bundleDir, { recursive: true })
+writeFileSync(join(bundleDir, 'package.json'), JSON.stringify({
+  name: 'dsh-profile-mount-test-bundle',
+  private: true,
+  dsh: { bundle: { patch: './cordis.patch.yml' } },
+}, null, 2))
+writeFileSync(join(bundleDir, 'cordis.patch.yml'), `# The host rows this plugin needs, then the plugin itself: one insert over the
+# empty profile root, the way dsh-base declares its own rows.
 - insert:
-    - id: llm
-      name: '@deepseek-ai/dsh-llm'
+${hasSettingsFile
+  ? `  - id: settings
+    name: '@deepseek-ai/dsh-settings-file'
+    config:
+      path: ${JSON.stringify(join(scratch, 'settings.yaml'))}
+`
+  : `  # dsh-settings injects configEditor and profileContext; the launcher provides
+  # the latter, and this harness replaces the launcher, so boot is given it below.
+  - id: config-editor
+    name: '@deepseek-ai/dsh-config-editor'
 
-    - id: settings
-      name: '@deepseek-ai/dsh-settings-file'
-      config:
-        path: ${JSON.stringify(join(scratch, 'settings.yaml'))}
+  - id: settings
+    name: '@deepseek-ai/dsh-settings'
+`}
+  - id: llm
+    name: '@deepseek-ai/dsh-llm'
 
-    - id: credentials
-      name: '@deepseek-ai/dsh-credentials-local'
-      config:
-        path: ${JSON.stringify(join(scratch, 'credentials.yaml'))}
+  - id: credentials
+    name: '@deepseek-ai/dsh-credentials-local'
+    config:
+      path: ${JSON.stringify(join(scratch, 'credentials.yaml'))}
 
-    - id: system-prompt
-      name: '@deepseek-ai/dsh-system-prompt'
+  - id: system-prompt
+    name: '@deepseek-ai/dsh-system-prompt'
 
-    - id: tools
-      name: '@deepseek-ai/dsh-tools'
+  - id: tools
+    name: '@deepseek-ai/dsh-tools'
 
-    - id: webserver
-      name: '@deepseek-ai/dsh-host-webserver'
-      config:
-        host: 127.0.0.1
-        port: 0
+  - id: webserver
+    name: '@deepseek-ai/dsh-host-webserver'
+    config:
+      host: 127.0.0.1
+      port: 0
 
-    - id: connection
-      name: '@deepseek-ai/dsh-client-connection'
+  - id: connection
+    name: '@deepseek-ai/dsh-client-connection'
 
-    - id: client-modules
-      name: '@deepseek-ai/dsh-client-modules'
+  - id: client-modules
+    name: '@deepseek-ai/dsh-client-modules'
 
-    - id: cline-pass
-      name: ${JSON.stringify(join(pluginDir, 'lib/index.js'))}
-      config:
-        baseURL: ${JSON.stringify(baseURL)}
-        apiKeyEnv: MOUNT_TEST_API_KEY
-        knownModels:
-          - cline-pass/glm-5.2
-          - cline-pass/kimi-k3
+  - id: cline-pass
+    name: ${JSON.stringify(join(pluginDir, 'lib/index.js'))}
 `)
 
 process.env.MOUNT_TEST_API_KEY = 'sk_mount_test_key'
@@ -118,9 +158,30 @@ process.env.MOUNT_TEST_API_KEY = 'sk_mount_test_key'
 
 let ctx
 try {
-  const patches = loadOptionalPatches('dsh', join(profileDir, 'cordis.patch.yml')) ?? []
-  check('the patch file composes', patches.length > 0, JSON.stringify(patches))
-  ctx = await boot('dsh', join(profileDir, 'cordis.yml'), patches)
+  // The launcher composes every layer: bundle patches first, then the profile's
+  // own patch. boot is handed the composed list, which is why the bundle
+  // package has to resolve exactly as it does in a real profile.
+  const loaded = loadProfileDirectory('dsh', profileDir, installAnchor)
+  const patches = [
+    ...loaded.layers.flatMap((layer) => layer.patches),
+    ...loaded.patches,
+  ]
+  check('the patch file composes', patches.length > 0, JSON.stringify(patches.length))
+  check('the bundle layer contributes the host rows', loaded.layers.length === 1 && loaded.layers[0].patches.length > 0, JSON.stringify(loaded.layers.map((layer) => layer.packageName)))
+  ctx = await boot('dsh', join(profileDir, 'cordis.yml'), patches, hasSettingsFile ? undefined : (hostCtx) => {
+    // dsh-settings and config-editor both inject profileContext, which the
+    // launcher normally provides; this harness replaces the launcher, so it
+    // supplies the same shape over the throwaway profile.
+    hostCtx.provide('profileContext', {
+      name: 'dsh',
+      dir: profileDir,
+      patchPath: join(profileDir, 'cordis.patch.yml'),
+      installAnchor,
+      cwd: process.cwd(),
+      home: process.env.DSH_HOME ?? join(process.cwd(), '.dsh'),
+      overlays: [],
+    })
+  })
   check('the tree mounted with every row activated', true)
 
   const entries = [...ctx.loader.entries()].map((entry) => entry.options?.id ?? entry.options?.name)
@@ -272,7 +333,12 @@ try {
   check('the panel state confirms the configured key', stateResponse.json?.value?.ready === true, JSON.stringify(stateResponse.json?.value?.ready))
 
   const pinResponse = await panelPost(envelope('model.pin', { model: 'cline-pass/kimi-k3', upstreams: ['gmicloud'], pinMode: 'preferred', sort: 'ttft' }), cookie)
-  check('a panel write reaches the settings document', pinResponse.status === 200 && JSON.stringify(settings.get('cline-pass')?.perModel?.['cline-pass/kimi-k3']?.upstreams) === JSON.stringify(['gmicloud']), JSON.stringify(settings.get('cline-pass')?.perModel))
+  // Read the written document rather than a service accessor: `settings.get`
+  // existed on 0.1.5 and is gone in 0.1.7, while the profile patch is the same
+  // file on both lines and is what "reaches the settings document" means.
+  const writtenPatch = readFileSync(join(profileDir, 'cordis.patch.yml'), 'utf8')
+  const writtenPerModel = /perModel:/.test(writtenPatch) && /gmicloud/.test(writtenPatch)
+  check('a panel write reaches the settings document', pinResponse.status === 200 && writtenPerModel, `${pinResponse.status} — ${writtenPatch.slice(0, 200)}`)
 
   const unknownResponse = await panelPost(envelope('nope'), cookie)
   check('an unknown action is a typed failure over the wire', unknownResponse.status === 200 && unknownResponse.json?.ok === false, `HTTP ${unknownResponse.status} — ${unknownResponse.text.slice(0, 120)}`)

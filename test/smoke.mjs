@@ -253,7 +253,17 @@ try {
   // makes the panel's saves fail while its reads still work — exactly the
   // "buttons do nothing" failure. The whole section is live: every consumer
   // reads through the plugin's `current()` source thunk.
-  check('the config section is declared volatile so settings writes are accepted', Config.meta?.volatile === true, String(Config.meta?.volatile))
+  // Marking the writable fields is what the shipped packages do (ui-theme,
+  // agent-default-model, bash-local, llm-pi-ai): a whole-object `.volatile()`
+  // instead collapses the schema to `{}`, dropping every default with it.
+  // This mirrors `volatileForm()` in dsh-settings, which walks the schema and
+  // returns undefined when no field is live.
+  const hasLiveField = (schema) => {
+    if (schema?.meta?.volatile === true) return true
+    if (schema?.type !== 'object') return false
+    return Object.values(schema.dict ?? {}).some(hasLiveField)
+  }
+  check('the config writes into live fields so settings saves are accepted', hasLiveField(Config) === true, JSON.stringify(Config.meta))
 
   const plannerPin = injectPrefs({ model: 'm' }, { pipeline: 'planner', upstreams: ['alibaba', 'baseten'] }, { upstream: 'alibaba', strict: true, sort: 'cost' })
   check('strict pin on the planner pipeline uses providerOptions.gateway.only', same(plannerPin.providerOptions, { gateway: { only: ['alibaba'], sort: 'cost' } }), JSON.stringify(plannerPin))
