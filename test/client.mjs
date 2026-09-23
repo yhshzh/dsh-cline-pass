@@ -127,6 +127,19 @@ let missingRequires = []
 // other shapes a host can present. `stableChevronCalls` proves this shape is
 // the one actually used, not merely tolerated.
 const PRIMITIVES_SPECIFIER = '@deepseek-ai/dsh-client-ui-primitives'
+
+/**
+ * A primitives face whose chevron records the exact export name it was read by.
+ *
+ * Asserting only that "a host icon was used" cannot tell a correct resolution
+ * from one that silently falls through to a lower-preference name — both draw a
+ * host icon. Each name below reports itself so the test can name the winner.
+ */
+function taggedPrimitives(names, picked) {
+  const face = {}
+  for (const name of names) face[name] = () => { picked.push(name); return null }
+  return face
+}
 let stableChevronCalls = 0
 const primitivesStub = {
   IconChevronDownOutline14: () => {
@@ -134,6 +147,9 @@ const primitivesStub = {
     return null
   },
 }
+
+/** Effect callbacks the bundle's React stub captured, in render order. */
+const collectedEffects = []
 
 function makeRequire(primitives = primitivesStub) {
   const React = {
@@ -147,7 +163,12 @@ function makeRequire(primitives = primitivesStub) {
       const value = typeof initial === 'function' ? initial() : initial
       return [value === false ? true : value, () => {}]
     },
-    useEffect: () => {},
+    // Effects are where the panel reaches for its actions, and they run after
+    // the first paint — outside every error boundary the render assertions
+    // exercise. Collect them so a test can run them: a face advertising an
+    // action the controller no longer defines calls it from here, and the throw
+    // takes the whole panel down without failing any render assertion.
+    useEffect: (callback) => { collectedEffects.push(callback) },
     useMemo: (factory) => factory(),
     useRef: () => ({ current: undefined }),
   }
@@ -412,9 +433,39 @@ for (const registration of registrations) {
   check(`rendering ${label} produces a tree`, result.tree !== null && result.tree !== undefined)
   const serialized = JSON.stringify(result.tree)
   check(`rendering ${label} does not leak a Host object`, !serialized.includes('"rpc"') && !serialized.includes('Symbol('), serialized.slice(0, 120))
-  // Effects are captured, never run: the RPC read they trigger needs a live
-  // browser session, and running it here would assert nothing about rendering.
+  // The effects are where the panel reaches for its actions, and they run after
+  // the first paint — outside every error boundary the render assertions above
+  // exercise. A face advertising an action the controller no longer defines
+  // (calling `props.loadUsage()` on a deleted method) therefore blanks the real
+  // panel while all of those assertions still pass. Run them here instead.
   check(`rendering ${label} registers effects without throwing`, Array.isArray(result.effects))
+}
+
+// ── run the effects the first render registered ─────────────────────────────
+//
+// The stub collects them rather than running them, because a real mount runs
+// them right after paint. They are the only place some actions are reached, so a
+// face that advertises an action the controller no longer defines throws here —
+// after paint, where nothing catches it, blanking the whole panel while every
+// render assertion above still passes.
+{
+  const savedFetch = globalThis.fetch
+  globalThis.fetch = async () => ({ ok: true, async json() { return { ok: true, value: {} } } })
+  const thrown = []
+  for (const [index, effect] of collectedEffects.entries()) {
+    let cleanup = null
+    try {
+      cleanup = effect()
+    } catch (error) {
+      thrown.push(`[${index}] ${error?.message ?? error}`)
+    }
+    if (typeof cleanup === 'function') {
+      try { cleanup() } catch (error) { thrown.push(`[${index}] cleanup: ${error?.message ?? error}`) }
+    }
+  }
+  check('every effect the first render registered runs and cleans up', thrown.length === 0, thrown.join(' | '))
+  check('the first render registers at least one effect', collectedEffects.length > 0, String(collectedEffects.length))
+  globalThis.fetch = savedFetch
 }
 
 // ── the disclosure chevron across host icon sets ────────────────────────────
@@ -464,10 +515,16 @@ function renderWith(primitives, registration) {
   return runComponent(target.component, propsFor(target))
 }
 
-for (const [label, primitives] of [
-  ['0.1.6+ artwork/regular/medium triple', { IconChevronDownOutlineRegular: () => null, IconChevronDownOutlineMedium: () => null }],
-  ['a seed table without any chevron icon', {}],
+for (const [label, names, expected] of [
+  // This is what the shipping host actually publishes, and the bundle used to
+  // omit the unsuffixed name — it silently fell back to a lower-preference one.
+  ['the shipping fan-out set', ['IconChevronDownOutline', 'IconChevronDownOutlineArtwork', 'IconChevronDownOutlineRegular', 'IconChevronDownOutlineMedium'], 'IconChevronDownOutline'],
+  ['0.1.2-0.1.5 single name', ['IconChevronDownOutline14'], 'IconChevronDownOutline14'],
+  ['an artwork/regular/medium triple', ['IconChevronDownOutlineRegular', 'IconChevronDownOutlineMedium'], 'IconChevronDownOutlineRegular'],
+  ['a seed table without any chevron icon', [], null],
 ]) {
+  const picked = []
+  const primitives = taggedPrimitives(names, picked)
   let result = null
   try {
     result = renderWith(primitives, 'settings.plugins.tab')
@@ -476,6 +533,14 @@ for (const [label, primitives] of [
     continue
   }
   check(`the Plugins tab renders under ${label}`, result.tree !== null && result.tree !== undefined)
+  // The bundle picks one name at load. Assert it picked the highest-preference
+  // one this host publishes, and that an unknown host falls back to the glyph.
+  const usedFallback = JSON.stringify(result.tree ?? null).includes('M4 6.5 8 10.5 12 6.5')
+  if (expected === null) {
+    check(`the inline glyph is the fallback under ${label}`, usedFallback, `picked=${JSON.stringify(picked)}`)
+  } else {
+    check(`the Plugins tab resolves the chevron under ${label}`, picked.includes(expected), `expected=${expected} picked=${JSON.stringify(picked)}`)
+  }
   // The fallback is an inline <svg>; `undefined` as an element type is the
   // crash this guards against, and JSON keeps it out of the tree entirely.
   check(`no undefined element type leaks under ${label}`, !JSON.stringify(result.tree ?? null).includes('"type":null'), JSON.stringify(result.tree ?? null).slice(0, 120))
@@ -489,6 +554,35 @@ check('the injected face exposes the store hook', typeof firstFace.useClinePass 
 const snapshotA = firstFace.useClinePass((value) => value)
 check('the store starts in a loading state', snapshotA.status === 'loading', JSON.stringify(snapshotA).slice(0, 80))
 check('the store is uSES-safe (same reference between reads)', firstFace.useClinePass((value) => value) === snapshotA)
+
+// Every action the face advertises must exist on the controller. The face is
+// built from `controller.<name>` references, so a method deleted from the
+// controller while its reference stays behind yields `undefined` here — and the
+// panel calls several of them from an effect, after paint, where nothing catches
+// the throw and the whole panel goes blank.
+{
+  const savedFetch = globalThis.fetch
+  globalThis.fetch = async () => ({ ok: true, async json() { return { ok: true, value: {} } } })
+  const advertised = Object.entries(firstFace).filter(([, value]) => typeof value === 'function' && value !== firstFace.useClinePass)
+  const missing = advertised.filter(([, value]) => value === undefined).map(([name]) => name)
+  check('every advertised action is a real function', missing.length === 0, `undefined: ${missing.join(', ')}`)
+  // Call each one: a method that exists but reaches for something absent throws
+  // just as loudly, and that is exactly what the panel's own effects do.
+  const args = {
+    setKey: ['CLINE_PASS_API_KEY', 'sk_typed'], testKey: ['CLINE_PASS_API_KEY', 'sk_typed'],
+    saveAndTest: ['CLINE_PASS_API_KEY', 'sk_typed'], addAccount: [{ name: 'a', key: 'sk_k' }],
+    removeAccount: ['a'], setAccountMode: [{ mode: 'single' }], setAccountEnabled: ['a', true],
+    pinModel: [{ model: 'm', upstreams: [], exclude: [], sort: 'none' }], setModelVisible: ['m', true],
+    setModelsVisibility: ['all'], probeModel: ['m'], validateModel: ['m'], testModel: ['m'],
+    resetModel: ['m'], loadHistory: [5], loadUsage: [true],
+  }
+  const thrown = []
+  for (const [name, fn] of advertised) {
+    try { await fn(...(args[name] ?? [])) } catch (error) { thrown.push(`${name}: ${error?.message ?? error}`) }
+  }
+  check('every advertised action is callable', thrown.length === 0, thrown.join(' | '))
+  globalThis.fetch = savedFetch
+}
 
 // The delete button is gated on `declared`, not on the pool size: an implicit
 // account is the top-level key with nothing to delete, while a materialized one
