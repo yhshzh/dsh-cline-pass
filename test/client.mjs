@@ -308,6 +308,21 @@ function renderCardText() {
   return collectText(resolveComponents(runComponent(cardRegistrationForText.component, propsFor(cardRegistrationForText)).tree)).join(' ')
 }
 
+/**
+ * Every element in a rendered tree whose handler text matches.
+ *
+ * The delete button's disabled state is the thing being checked, and it is not
+ * visible in the collected copy: a disabled button still renders its label.
+ */
+function findButtons(node, label, found = []) {
+  if (node === null || node === undefined || typeof node !== 'object') return found
+  if (Array.isArray(node)) { for (const child of node) findButtons(child, label, found); return found }
+  const children = node.props?.children
+  if (node.type === 'button' && collectText(children).includes(label)) found.push(node)
+  findButtons(children, label, found)
+  return found
+}
+
 // A namespace the shared registry knows nothing about makes `locale.bind` echo
 // the key back rather than throw. The panel must still render its own copy.
 //
@@ -318,7 +333,7 @@ function renderCardText() {
 stubLocale = echoingLocale('zh')
 const chinese = renderCardText()
 check('an unresolved locale lookup still renders Chinese copy', chinese.includes('尚未配置 API Key') && chinese.includes('订阅模型的渠道钉住'), chinese.slice(0, 160))
-check('no raw i18n key leaks into the rendered panel', !/\bkeyMissing\b|\bnotReady\b|\bautoSetup\b|\bhistory\b/.test(chinese), chinese.slice(0, 200))
+check('no raw i18n key leaks into the rendered panel', !/\bkeyMissing\b|\bhistory\b|\busageTitle\b/.test(chinese), chinese.slice(0, 200))
 
 stubLocale = echoingLocale('en')
 const english = renderCardText()
@@ -438,9 +453,47 @@ const snapshotA = firstFace.useClinePass((value) => value)
 check('the store starts in a loading state', snapshotA.status === 'loading', JSON.stringify(snapshotA).slice(0, 80))
 check('the store is uSES-safe (same reference between reads)', firstFace.useClinePass((value) => value) === snapshotA)
 
+// The delete button is gated on `declared`, not on the pool size: an implicit
+// account is the top-level key with nothing to delete, while a materialized one
+// must stay removable even when it is the only account. Gating on the pool size
+// left the button permanently dead for the common single-account case.
+{
+  const savedFetch = globalThis.fetch
+  const seeded = (declared) => {
+    globalThis.fetch = async () => ({
+      ok: true,
+      async json() {
+        return {
+          ok: true,
+          value: {
+            provider: 'cline-pass', displayName: 'Cline Pass', baseURL: 'https://api.cline.bot/api/v1',
+            settingsAvailable: true, accountMode: 'single', activeAccount: '', ready: true,
+            accounts: [{ key: 'default', displayName: 'Cline Pass', apiKeyEnv: 'CLINE_PASS_API_KEY', enabled: true, declared, keyConfigured: true, keyHint: 'sk_liv…3456' }],
+            models: [], pinnedModels: 0, hiddenModels: 0, catalogCount: 0, historySize: 0, usage: null,
+          },
+        }
+      },
+    })
+  }
+  const removeButton = async (declared) => {
+    seeded(declared)
+    await firstFace.refresh()
+    const tree = runComponent(faceRegistration.component, firstFace).tree
+    const expanded = resolveComponents(tree)
+    const buttons = findButtons(expanded, '删除')
+    return buttons.find((button) => button.props.disabled !== undefined)
+  }
+  const implicit = await removeButton(false)
+  const materialized = await removeButton(true)
+  check('the delete button is disabled for an implicit account', implicit?.props.disabled === true, JSON.stringify(implicit?.props.disabled))
+  check('the delete button is enabled for a declared account', materialized?.props.disabled === false, JSON.stringify(materialized?.props.disabled))
+  globalThis.fetch = savedFetch
+  await firstFace.refresh()
+}
+
 // The actions the panel exposes must all be callable; each one is what a
 // button in the rendered tree binds to.
-for (const name of ['refresh', 'setKey', 'testKey', 'saveAndTest', 'addAccount', 'removeAccount', 'setAccountMode', 'setAccountEnabled', 'pinModel', 'setModelVisible', 'setModelsVisibility', 'setupModel', 'probeModel', 'validateModel', 'testModel', 'resetModel', 'refreshModels', 'loadUsage', 'loadPlan', 'loadUsageWindows', 'loadHistory']) {
+for (const name of ['refresh', 'setKey', 'testKey', 'saveAndTest', 'addAccount', 'removeAccount', 'setAccountMode', 'setAccountEnabled', 'pinModel', 'setModelVisible', 'setModelsVisibility', 'probeModel', 'validateModel', 'testModel', 'resetModel', 'refreshModels', 'loadUsage', 'loadHistory']) {
   check(`the injected face exposes ${name}`, typeof firstFace[name] === 'function')
 }
 

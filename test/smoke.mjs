@@ -922,6 +922,18 @@ try {
   // live config the tool checks above just exercised.
   const panel = createPanel({ control: panelControl, engine: panelEngine, store })
 
+  // A fresh install has no `accounts` entry at all: the single account is the
+  // top-level key and its `apiKeyEnv`. There is nothing to delete, so the panel
+  // must say so rather than offering a button that cannot work.
+  {
+    const saved = section.accounts
+    section = { ...section, accounts: {} }
+    const fresh = createPanel({ control: panelControl, engine: panelEngine, store })
+    const freshState = await fresh.state({})
+    check('an implicit account is reported as undeclared', freshState.accounts.length === 1 && freshState.accounts[0].declared === false, JSON.stringify(freshState.accounts.map((account) => [account.key, account.declared])))
+    section = { ...section, accounts: saved }
+  }
+
   const panelState = await panel.state({})
   check('panel state exposes the route and the masked account', panelState.provider === 'cline-pass' && panelState.accounts[0].keyHint === 'sk_liv…3456', JSON.stringify(panelState.accounts))
   check('panel state reports readiness from the stored key', panelState.ready === true)
@@ -937,8 +949,13 @@ try {
   await panel['key.set']({ ref: panelPrimary, value: 'sk_replaced_key_000000' })
   check('key.set stores the literal in the credential store', credentials.get(panelPrimary) === 'sk_replaced_key_000000', String(credentials.get(panelPrimary)))
 
+  // `declared` is what the delete button is gated on, and it has to be true for
+  // every account the pool materialized: gating on the pool size instead left
+  // the button dead for the common single-account case.
+  check('a materialized account reports itself as removable', panelState.accounts.length === 1 && panelState.accounts[0].declared === true, JSON.stringify(panelState.accounts.map((account) => [account.key, account.declared])))
   const panelAdded = await panel['account.add']({ name: 'panel', key: 'sk_panel_account_1111' })
   check('account.add registers the account and stores its key', panelAdded.accounts.some((account) => account.key === 'panel') && credentials.get('CLINE_PASS_PANEL_KEY') === 'sk_panel_account_1111')
+  check('every account written into the pool is removable', panelAdded.accounts.every((account) => account.declared === true), JSON.stringify(panelAdded.accounts.map((account) => [account.key, account.declared])))
   const panelMode = await panel['account.mode']({ mode: 'roundrobin' })
   check('account.mode switches the pool', panelMode.accountMode === 'roundrobin' && section.accountMode === 'roundrobin')
   const panelRemoved = await panel['account.remove']({ name: 'panel' })
@@ -956,22 +973,6 @@ try {
   check('model.validate reports a verdict per channel', panelValidated.results.length === 2 && panelValidated.summary.ok === 2, JSON.stringify(panelValidated.summary))
   const panelTest = await panel['model.test']({ model: 'cline-pass/glm-5.2', upstreams: ['alibaba'] })
   check('model.test reports what actually served the call', panelTest.ok === true && panelTest.actual === 'alibaba', JSON.stringify(panelTest))
-
-  // A dead channel is never auto-pinned: with one channel refusing, the healthy
-  // one is pinned alone; with every channel refusing, the probe itself reports
-  // the failure and nothing is pinned at all.
-  stub.broken = ['baseten']
-  const auto = await panel['setup.auto']({ model: 'cline-pass/glm-5.2' })
-  check('setup.auto pins only the channels that answered', auto.ok === true && same(auto.pinned, ['alibaba']), JSON.stringify(auto))
-  check('setup.auto excludes the channel that refused', same(auto.excluded, ['baseten']), JSON.stringify(auto.excluded))
-  check('setup.auto verified the pin with a real call', auto.verified === true && auto.actual === 'alibaba', JSON.stringify(auto))
-  check('setup.auto persisted a preferred pin', section.perModel['cline-pass/glm-5.2'].pinMode === 'preferred', JSON.stringify(section.perModel['cline-pass/glm-5.2']))
-  stub.broken = ['alibaba', 'baseten']
-  const autoFailed = await panel['setup.auto']({ model: 'cline-pass/glm-5.2' })
-  check('setup.auto reports failure instead of pinning a dead channel', autoFailed.ok === false && autoFailed.pinned.length === 0, JSON.stringify(autoFailed))
-  check('setup.auto explains itself', autoFailed.error.length > 0, autoFailed.error)
-  check('a failed setup still returns the full shape', autoFailed.channels.length === 0 && autoFailed.summary !== undefined && autoFailed.available.length === 0)
-  stub.broken = []
 
   const panelReset = await panel['model.reset']({ model: 'cline-pass/glm-5.2' })
   check('model.reset returns the model to automatic routing', panelReset.pin.upstreams.length === 0 && panelReset.pin.exclude.length === 0, JSON.stringify(panelReset.pin))
