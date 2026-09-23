@@ -344,6 +344,43 @@ check('the two locales really differ', chinese !== english)
 stubLocale = undefined
 check('a composition without the locale service still renders Chinese', renderCardText().includes('尚未配置 API Key'))
 
+// ── the loaded panel renders ────────────────────────────────────────────────
+//
+// The assertions above render the panel before any read has answered, so every
+// section below the status line is absent — a component that only throws once
+// real data reaches it (a renamed helper, a changed argument list) would pass
+// them all. This renders the whole panel against a fully populated snapshot,
+// which is the state a user actually looks at.
+{
+  const store = cardRegistrationForText.options.inject().hooks.clinePass
+  const snapshot = store.getSnapshot()
+  const accounts = [{ key: 'default', displayName: 'Cline Pass', apiKeyEnv: 'CLINE_PASS_API_KEY', enabled: true, declared: true, keyConfigured: true, keyHint: 'sk_liv…3456' }]
+  const models = [{ id: 'cline-pass/glm-5.2', hidden: false, pinned: ['alibaba'], excluded: ['baseten'], upstreams: ['alibaba', 'baseten'], upstreamStatus: [{ upstream: 'alibaba', status: 'ok', note: '' }], targets: ['alibaba'] }]
+  const usage = { fetchedAt: Date.now(), accounts: [{ account: 'default', ok: true, limits: [{ type: 'five_hour', percentUsed: 25, resetsAt: new Date(Date.now() + 3_600_000).toISOString() }, { type: 'weekly', percentUsed: 80, resetsAt: new Date(Date.now() + 86_400_000).toISOString() }, { type: 'made_up_window', percentUsed: 5, resetsAt: '' }] }] }
+  store.set({
+    ...snapshot,
+    status: 'ready',
+    data: {
+      provider: 'cline-pass', displayName: 'Cline Pass', baseURL: 'https://api.cline.bot/api/v1',
+      settingsAvailable: true, accountMode: 'single', activeAccount: '', ready: true,
+      accounts, models, pinnedModels: 1, hiddenModels: 0, catalogCount: 1, historySize: 2, usage,
+    },
+  })
+  let loaded = null
+  let loadedError = null
+  try {
+    loaded = collectText(resolveComponents(runComponent(cardRegistrationForText.component, propsFor(cardRegistrationForText)).tree)).join(' ')
+  } catch (error) {
+    loadedError = error
+  }
+  check('the fully loaded panel renders without throwing', loadedError === null, loadedError?.message ?? '')
+  check('the loaded panel shows the quota percentages', loaded !== null && loaded.includes('25%') && loaded.includes('80%'), (loaded ?? '').slice(0, 200))
+  check('the loaded panel names an unknown window verbatim', loaded !== null && loaded.includes('made_up_window'), (loaded ?? '').slice(0, 300))
+  check('the loaded panel shows the pinned channel', loaded !== null && loaded.includes('alibaba'), (loaded ?? '').slice(0, 300))
+  check('the loaded panel leaks no raw key', loaded !== null && !/keyMissing$|\bdata\b:/.test(loaded), (loaded ?? '').slice(0, 200))
+  store.set(snapshot)
+}
+
 // ── call every registered component ─────────────────────────────────────────
 
 /** Build the props a slot hands a component: the injected face plus hooks. */
