@@ -151,8 +151,8 @@ const primitivesStub = {
 /** Effect callbacks the bundle's React stub captured, in render order. */
 const collectedEffects = []
 
-function makeRequire(primitives = primitivesStub) {
-  const React = {
+function makeRequire(primitives = primitivesStub, react = undefined) {
+  const React = react ?? {
     createElement,
     Fragment: Symbol('Fragment'),
     // A boolean is this panel's disclosure state: the plugin card, the account
@@ -605,6 +605,169 @@ for (const [label, names, expected] of [
   // The fallback is an inline <svg>; `undefined` as an element type is the
   // crash this guards against, and JSON keeps it out of the tree entirely.
   check(`no undefined element type leaks under ${label}`, !JSON.stringify(result.tree ?? null).includes('"type":null'), JSON.stringify(result.tree ?? null).slice(0, 120))
+}
+
+// ── the quota card shows one account at a time ──────────────────────────────
+//
+// A pool of several accounts, each with three windows, stacked every reading at
+// once: the card became a wall of bars, no single account's remaining quota
+// could be read, and the card grew with the pool. It now shows one account with
+// `‹` `›` arrows, which is state held in the component — paging issues no
+// request, so it works while the panel is busy or the settings service is
+// read-only.
+//
+// The click-and-observe transition is the thing to test, and it needs hooks whose
+// state survives a re-render: `runComponent` starts a fresh cursor every call, so
+// a click there is unobservable. The bundle closes over the React it required, so
+// a persistent set has to be installed by loading it again.
+{
+  const hooks = []
+  let cursor = 0
+  const React = {
+    createElement,
+    Fragment: Symbol('Fragment'),
+    useState(initial) {
+      const index = cursor++
+      if (!(index in hooks)) hooks[index] = typeof initial === 'function' ? initial() : initial
+      // A boolean in this panel is a disclosure, and the card under test is the
+      // folded body one guards.
+      if (hooks[index] === false) hooks[index] = true
+      return [hooks[index], (next) => { hooks[index] = typeof next === 'function' ? next(hooks[index]) : next }]
+    },
+    useEffect(callback) { collectedEffects.push(callback) },
+    useMemo(factory) { cursor += 1; return factory() },
+    useRef(initial) { cursor += 1; return { current: initial } },
+    useCallback(callback) { cursor += 1; return callback },
+  }
+  const load = []
+  const win = { __ModuleLoader__: { load: (entry) => load.push(entry) }, document: documentStub }
+  const previousWindow = globalThis.window
+  globalThis.window = win
+  try {
+    const run = new Function('window', 'document', 'require', source)
+    run(win, documentStub, makeRequire(primitivesStub, React))
+  } finally {
+    if (previousWindow === undefined) delete globalThis.window
+    else globalThis.window = previousWindow
+  }
+  const seen = []
+  const slots = {
+    inject: (key, callback) => { callback(); return () => {} },
+    register: (options, component) => { seen.push({ options, component }); return () => {} },
+  }
+  load[0].factory(makeRequire(primitivesStub, React)).apply({
+    logger: { info() {}, warn() {}, error() {} },
+    slots,
+    connection: connectionService,
+    effect: (body) => { const dispose = body(); return typeof dispose === 'function' ? dispose : () => {} },
+    get: (name) => (name === 'slots' ? slots : name === 'connection' ? connectionService : undefined),
+  })
+  const card = seen.find((entry) => entry.options.name === 'settings.plugins.tab').component
+  const cardProps = propsFor(seen.find((entry) => entry.options.name === 'settings.plugins.tab'))
+  const render = () => { cursor = 0; return card({ ...cardProps }) }
+  const copy = (tree) => collectText(resolveComponents(tree)).join(' ')
+  const navButton = (tree, label) => {
+    let found = null
+    const walk = (node) => {
+      if (node === null || node === undefined || typeof node !== 'object' || found !== null) return
+      if (Array.isArray(node)) { node.forEach(walk); return }
+      if (typeof node.type === 'function') { walk(node.type(node.props)); return }
+      if (node.type === 'button' && (node.props?.['aria-label'] === label || node.props?.title === label)) found = node
+      walk(node.props?.children)
+    }
+    walk(resolveComponents(tree))
+    return found
+  }
+  const store = cardProps.hooks.clinePass
+  const snapshot = store.getSnapshot()
+  const reading = (name, percent, ok = true) => ({
+    account: name, displayName: `名字 ${name}`, ok,
+    limits: ok ? [{ type: 'five_hour', percentUsed: percent, resetsAt: new Date(Date.now() + 3_600_000).toISOString() }] : [],
+    ...(ok ? {} : { error: '读不到' }),
+  })
+  const show = (accounts, mode = 'single', active = '') => store.set({
+    ...snapshot,
+    status: 'ready',
+    data: {
+      provider: 'cline-pass', ready: true, settingsAvailable: true, accountMode: mode, activeAccount: active,
+      accounts: accounts.map((key) => ({ key, enabled: true, declared: true })),
+      models: [], pinnedModels: 0, hiddenModels: 0, catalogCount: 0, historySize: 0,
+      usage: { fetchedAt: Date.now(), accounts: accounts.map((key, index) => reading(key, [11, 22, 33][index] ?? 44, key !== 'b')) },
+    },
+  })
+  /** The quota card's own region: `当前` is also the accounts card's column head. */
+  const quota = (text) => {
+    const from = text.indexOf('官方额度')
+    if (from < 0) return ''
+    const to = text.indexOf('订阅模型', from)
+    return text.slice(from, to < 0 ? undefined : to)
+  }
+  const next = '下一个账号'
+  const prev = '上一个账号'
+  const click = (label) => {
+    const button = navButton(render(), label)
+    if (button === null) return false
+    button.props.onClick()
+    return true
+  }
+
+  show(['a', 'b', 'c'], 'single', 'b')
+  let view = copy(render())
+  check('the quota card shows one account at a time', view.includes('名字 a') && !view.includes('名字 b') && !view.includes('名字 c'), quota(view).slice(0, 120))
+  check('the quota card shows which account of how many', view.includes('1 / 3'), quota(view).slice(0, 120))
+
+  check('the quota card offers a next-account control', click(next), 'no button')
+  view = copy(render())
+  check('next moves to the second account', view.includes('名字 b'), quota(view).slice(0, 120))
+  check('an account whose read failed still shows its own error', view.includes('读不到'), quota(view).slice(0, 160))
+  click(next); view = copy(render())
+  check('next moves to the third account', view.includes('名字 c') && view.includes('3 / 3'), quota(view).slice(0, 120))
+  click(next); view = copy(render())
+  check('next wraps back to the first account', view.includes('名字 a') && view.includes('1 / 3'), quota(view).slice(0, 120))
+  check('the quota card offers a previous-account control', click(prev), 'no button')
+  view = copy(render())
+  check('previous wraps backwards to the last account', view.includes('名字 c') && view.includes('3 / 3'), quota(view).slice(0, 120))
+
+  // Removing accounts shortens the reading under a selection that is now past
+  // its end; the card must clamp rather than index off the list.
+  show(['a', 'b', 'c'], 'single', '')
+  click(next); click(next)          // deliberately on the last of three
+  show(['a'], 'single', '')
+  // A dropped account must not throw either: an index left past the end reads
+  // `undefined.account` and takes the whole panel with it, so catch it here
+  // rather than let one mutation abort the run.
+  let shrunk = ''
+  let shrunkError = null
+  try {
+    shrunk = quota(copy(render()))
+  } catch (error) {
+    shrunkError = error
+  }
+  check('a reading that shrank under the selection does not blank the card', shrunkError === null && (shrunk.includes('名字 a') || shrunk.includes('11%')), shrunkError?.message ?? shrunk.slice(0, 160))
+
+  show(['a'], 'single', 'a')
+  check('a single account gets no pager controls', navButton(render(), next) === null && navButton(render(), prev) === null)
+
+  // The badge names the account a request would use. Paging must land it on that
+  // account and on no other, whatever page the component happens to be on.
+  const badgeOn = (mode, active) => {
+    show(['a', 'b'], mode, active)
+    const badged = []
+    for (let page = 0; page < 2; page += 1) {
+      const region = quota(copy(render()))
+      if (region.includes('当前')) badged.push(['名字 a', '名字 b'].find((name) => region.includes(name)))
+      click(next)
+    }
+    return badged
+  }
+  check('single mode marks exactly the account a request would use', JSON.stringify(badgeOn('single', 'b')) === JSON.stringify(['名字 b']), JSON.stringify(badgeOn('single', 'b')))
+  // Round-robin rotates every request, so a badge would name a moving fact.
+  show(['a', 'b'], 'roundrobin', 'a')
+  check('round-robin shows no current badge', !quota(copy(render())).includes('当前'), quota(copy(render())).slice(0, 120))
+  // An empty `activeAccount` means "first enabled", not "none".
+  check('an empty activeAccount resolves to the first enabled account', JSON.stringify(badgeOn('single', '')) === JSON.stringify(['名字 a']), JSON.stringify(badgeOn('single', '')))
+
+  store.set(snapshot)
 }
 
 // ── the registration face is live, not a snapshot ───────────────────────────
