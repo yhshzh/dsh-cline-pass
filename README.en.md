@@ -68,7 +68,7 @@ To override defaults, add a `cline-pass` section to your profile's `$DSH_HOME/pr
         apiKeyEnv: CLINE_PASS_BACKUP_KEY
 ```
 
-Common settings include `baseURL`, `knownModels`, `models`, `perModel`, `exposeCatalog`, and `historyLimit`. The default gateway is `https://api.cline.bot/api/v1`.
+Common settings include `baseURL`, `knownModels`, `models`, `perModel`, `exposeCatalog`, and `historyLimit`. The default gateway is `https://api.cline.bot/api/v1`. `maxConcurrentRequests` caps how many streams each account keeps open to the gateway at once (default 16); further requests wait for a free slot, and `0` lifts the cap.
 
 ## Upstream channels
 

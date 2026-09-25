@@ -17,7 +17,7 @@
 import { createServer } from 'node:http'
 import { validateJsonSchemaValue } from '@deepseek-ai/dsh-tools'
 import { ClinePassAdapter, Config, DEFAULT_REQUEST_IMAGE_POLICY, apply, inject, name } from '../lib/index.js'
-import { buildRequestBody, prepareRequestImages, projectImageDimensions, reasoningOf, requestImageTarget } from '../lib/adapter.js'
+import { buildRequestBody, createUpstreamSlots, prepareRequestImages, projectImageDimensions, reasoningOf, requestImageTarget } from '../lib/adapter.js'
 import { createEngine } from '../lib/engine.js'
 import { createPanel, PANEL_ERROR_CODE, PANEL_PATH, registerPanel } from '../lib/panel.js'
 import {
@@ -171,6 +171,66 @@ const gateway = createServer(async (request, response) => {
 await new Promise((resolve) => gateway.listen(0, '127.0.0.1', resolve))
 const baseURL = `http://127.0.0.1:${gateway.address().port}/api/v1`
 
+/**
+ * A second gateway whose streams stay open until the test lets them finish.
+ *
+ * It counts open streams on the server side, which is the number a concurrency
+ * cap has to bound: a client that stopped counting once headers arrived would
+ * still let every stream through here.
+ */
+const held = {
+  /** streams open right now */
+  open: 0,
+  /** the most streams that were open at once */
+  peak: 0,
+  /** requests received */
+  requests: 0,
+  /** finishers of the streams held open, in arrival order */
+  pending: [],
+  /** how the next stream answers: `hold`, `timed`, or `refuse` */
+  mode: 'hold',
+  /** how long a `timed` stream stays open, in ms */
+  holdMs: 40,
+}
+
+const heldGateway = createServer(async (request, response) => {
+  for await (const chunk of request) void chunk
+  held.requests += 1
+  if (held.mode === 'refuse') {
+    response.writeHead(400, { 'Content-Type': 'application/json' })
+    return response.end(JSON.stringify({ error: 'invalid_request_error: upstream alibaba refused the pin' }))
+  }
+  held.open += 1
+  held.peak = Math.max(held.peak, held.open)
+  // `finish` fires before the client can read the last byte, so a stream is
+  // never still counted when the request it freed a slot for arrives.
+  let closed = false
+  const close = () => {
+    if (closed) return
+    closed = true
+    held.open -= 1
+  }
+  response.once('finish', close)
+  response.once('close', close)
+  response.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache' })
+  const [first, ...rest] = streamFrames('alibaba', 'planner', 'text')
+  response.write(`data: ${JSON.stringify(first)}\n\n`)
+  if (held.mode === 'timed') await new Promise((resolve) => setTimeout(resolve, held.holdMs))
+  else await new Promise((resolve) => held.pending.push(resolve))
+  if (closed) return
+  for (const frame of rest) response.write(`data: ${JSON.stringify(frame)}\n\n`)
+  response.write('data: [DONE]\n\n')
+  response.end()
+})
+
+await new Promise((resolve) => heldGateway.listen(0, '127.0.0.1', resolve))
+const heldBaseURL = `http://127.0.0.1:${heldGateway.address().port}/api/v1`
+
+/** Let every stream the held gateway is holding finish. */
+function finishHeld() {
+  for (const finish of held.pending.splice(0)) finish()
+}
+
 // ── harness ─────────────────────────────────────────────────────────────────
 
 let passed = 0
@@ -258,6 +318,38 @@ function adapterFor({ store, pin = () => ({}), records = [], learned = [], attac
     }),
     records,
     learned,
+  }
+}
+
+/** An adapter on the held gateway, with the given per-account cap. */
+function heldAdapter({ limit, account = () => 'main' }) {
+  return new ClinePassAdapter({
+    connection: () => ({
+      baseURL: heldBaseURL,
+      displayName: 'Cline Pass',
+      models: Object.keys(PIPELINES).map((id) => ({ id, name: id })),
+      defaultContextWindow: 128000,
+      maxTokens: 32000,
+      reasoningModels: true,
+      streamIdleTimeoutMs: 30000,
+      maxConcurrentRequests: limit,
+    }),
+    modelMeta: () => ({}),
+    pin: () => ({}),
+    resolveAccount: async () => ({ name: account(), key: 'sk_test', baseURL: heldBaseURL }),
+    discoveredContext: () => undefined,
+    record: () => {},
+    learnUpstream: () => {},
+  })
+}
+
+/** One plain text request for the held gateway, cancellable through `signal`. */
+function heldRequest(signal = new AbortController().signal) {
+  return {
+    provider: 'cline-pass',
+    model: 'cline-pass/glm-5.2',
+    messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
+    signal,
   }
 }
 
@@ -497,6 +589,156 @@ try {
   check('a call that never got a byte records a zero first-byte time', exhausted.records[0].ttfb === 0, JSON.stringify(exhausted.records[0].ttfb))
   stub.broken = []
 
+  // ── upstream concurrency ──────────────────────────────────────────────────
+  // Each stream to the gateway holds a per-account slot for as long as its body
+  // is open (CWE-770, reported in #10). The limiter is checked on its own
+  // first, then through the adapter against the gateway that holds streams open.
+
+  const tick = () => new Promise((resolve) => setImmediate(resolve))
+  const settle = (promise) => promise.then((value) => ({ value }), (error) => ({ error }))
+  /** Resolve to `undefined` instead of hanging when `promise` takes over `ms`. */
+  const within = (promise, ms) => Promise.race([promise, new Promise((resolve) => setTimeout(resolve, ms).unref())])
+  const until = async (condition, ms = 2000) => {
+    const deadline = Date.now() + ms
+    while (!condition() && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 5))
+    return condition()
+  }
+
+  const slots = createUpstreamSlots()
+  const firstHolder = await slots.acquire('a', 1)
+  let waiterGranted = false
+  const waiter = slots.acquire('a', 1).then((release) => {
+    waiterGranted = true
+    return release
+  })
+  firstHolder()
+  // A request arriving in the same tick the slot is freed must queue behind the
+  // waiter, not take the slot alongside it.
+  let intruderGranted = false
+  const intruder = slots.acquire('a', 1).then((release) => {
+    intruderGranted = true
+    return release
+  })
+  await tick()
+  check('a freed slot goes to the waiter, not to a request arriving in between', waiterGranted && !intruderGranted, `waiter=${waiterGranted} intruder=${intruderGranted}`)
+  const waiterRelease = await within(waiter, 200)
+  waiterRelease?.()
+  waiterRelease?.()
+  let extraGranted = false
+  const extra = slots.acquire('a', 1).then((release) => {
+    extraGranted = true
+    return release
+  })
+  await tick()
+  check('releasing a slot twice frees it once', intruderGranted && !extraGranted, `intruder=${intruderGranted} extra=${extraGranted}`)
+  const intruderRelease = await within(intruder, 200)
+  intruderRelease?.()
+  const extraRelease = await within(extra, 200)
+  extraRelease?.()
+
+  const occupier = await slots.acquire('b', 1)
+  const leaving = new AbortController()
+  const leaver = settle(slots.acquire('b', 1, leaving.signal))
+  leaving.abort(new Error('caller went away'))
+  const left = await within(leaver, 200)
+  check('a queued acquire rejects as soon as its signal aborts', left?.error?.message === 'caller went away', left === undefined ? 'still waiting' : String(left.error?.message ?? 'granted'))
+  occupier()
+  const afterLeaver = await within(slots.acquire('b', 1), 200)
+  check('an abandoned wait does not keep the slot it queued for', typeof afterLeaver === 'function')
+  afterLeaver?.()
+
+  const busy = await slots.acquire('c', 1)
+  const elsewhere = await within(slots.acquire('d', 1), 200)
+  check('one account at its cap does not hold up another', typeof elsewhere === 'function')
+  busy()
+  elsewhere?.()
+
+  const unlimited = await within(Promise.all(Array.from({ length: 50 }, () => slots.acquire('e', 0))), 200)
+  check('a limit of 0 lifts the cap', unlimited?.length === 50)
+  for (const release of unlimited ?? []) release()
+
+  const lone = await slots.acquire('f', 1)
+  let queuedAdmitted = false
+  const queuedBehind = slots.acquire('f', 1).then((release) => {
+    queuedAdmitted = true
+    return release
+  })
+  const raised = await within(slots.acquire('f', 3), 200)
+  await tick()
+  check('a raised limit admits the queue as well as the new caller', queuedAdmitted && typeof raised === 'function')
+  lone()
+  raised?.()
+  const queuedRelease = await within(queuedBehind, 200)
+  queuedRelease?.()
+
+  const holding = new AbortController()
+  await slots.acquire('g', 1, holding.signal)
+  const successor = within(slots.acquire('g', 1), 200)
+  holding.abort()
+  const successorRelease = await successor
+  check('a held slot is freed when its signal aborts', typeof successorRelease === 'function')
+  successorRelease?.()
+
+  // Through the adapter: the gateway's own count of open streams is the proof.
+  held.mode = 'timed'
+  held.peak = 0
+  const capped = heldAdapter({ limit: 4 })
+  const fanned = await within(Promise.all(Array.from({ length: 12 }, () => settle(collect(capped, heldRequest())))), 5000)
+  check('twelve concurrent streams all complete under a cap of four', fanned?.every((outcome) => outcome.value?.some((chunk) => chunk.type === 'text-delta')) === true, String(fanned === undefined ? 'timed out' : fanned.find((outcome) => outcome.error)?.error?.message))
+  check('no more than four streams were open upstream at once', held.peak === 4, `peak=${held.peak}`)
+
+  let heldAccount = 'main'
+  const single = heldAdapter({ limit: 1, account: () => heldAccount })
+  held.mode = 'hold'
+  const occupant = settle(collect(single, heldRequest()))
+  await until(() => held.pending.length === 1)
+  const sentBefore = held.requests
+  const cancelling = new AbortController()
+  const queuedAt = Date.now()
+  const cancelled = settle(collect(single, heldRequest(cancelling.signal)))
+  await new Promise((resolve) => setTimeout(resolve, 50))
+  cancelling.abort()
+  const cancelOutcome = await within(cancelled, 1000)
+  check('a request cancelled while it waits for a slot fails at once as ABORTED', cancelOutcome?.error?.code === 'ABORTED', `${cancelOutcome?.error?.code ?? 'still waiting'} after ${Date.now() - queuedAt}ms`)
+  check('a request cancelled while it waits never reaches the gateway', held.requests === sentBefore, `${held.requests - sentBefore} extra request(s)`)
+
+  // `main` is still full; a request routed to `backup` must not wait for it.
+  held.mode = 'timed'
+  heldAccount = 'backup'
+  const otherAccount = await within(settle(collect(single, heldRequest())), 1000)
+  check('a stream on another account is not held up by a full one', otherAccount?.value !== undefined && held.pending.length === 1, otherAccount === undefined ? 'timed out' : String(otherAccount.error?.message ?? ''))
+  heldAccount = 'main'
+  finishHeld()
+  const occupantOutcome = await within(occupant, 1000)
+  check('the stream that held the slot still completes', occupantOutcome?.value?.some((chunk) => chunk.type === 'text-delta') === true)
+
+  // Every way an attempt can end gives the slot back; with a cap of one, the
+  // next stream would otherwise wait forever.
+  held.mode = 'refuse'
+  const refusal = await within(settle(collect(single, heldRequest())), 1000)
+  held.mode = 'timed'
+  const afterRefusal = await within(settle(collect(single, heldRequest())), 1000)
+  check('a refused attempt gives its slot back', refusal?.error !== undefined && afterRefusal?.value !== undefined, `${refusal?.error?.message ?? 'no error'} / ${afterRefusal === undefined ? 'timed out' : 'ok'}`)
+
+  held.mode = 'hold'
+  const early = single.stream(heldRequest())
+  const earlyChunk = await within(early.next(), 1000)
+  await within(early.return(), 1000)
+  held.mode = 'timed'
+  const afterEarly = await within(settle(collect(single, heldRequest())), 1000)
+  check('a consumer that stops reading early gives its slot back', earlyChunk?.done === false && afterEarly?.value !== undefined)
+
+  held.mode = 'hold'
+  const midway = new AbortController()
+  const abandoned = single.stream(heldRequest(midway.signal))
+  await within(abandoned.next(), 1000)
+  // The caller aborts and never touches the stream again: no `next`, no `return`.
+  midway.abort()
+  held.mode = 'timed'
+  const afterAbandon = await within(settle(collect(single, heldRequest())), 1000)
+  check('a stream its caller aborts gives its slot back without being read again', afterAbandon?.value !== undefined)
+  finishHeld()
+
   // ── tools through the plugin ──────────────────────────────────────────────
 
   const tools = new Map()
@@ -626,6 +868,15 @@ try {
 
   check('the provider route is registered', same(fakeCtx.llm.registered?.routes, ['cline-pass']))
   check('the configurable-provider directory entry is registered', fakeCtx.llm.directory?.[0]?.provider === 'cline-pass' && fakeCtx.llm.directory[0].settingsNs === 'cline-pass')
+  // The cap reaches the adapter through the live section like every other
+  // connection fact, so a changed value applies to the next request.
+  check('the concurrency cap is read from the live settings', (() => {
+    const saved = section
+    section = { ...section, maxConcurrentRequests: 3 }
+    const read = fakeCtx.llm.registered.adapter.config.connection().maxConcurrentRequests
+    section = saved
+    return read === 3
+  })())
   const expectedTools = ['cline_pass_status', 'cline_pass_models', 'cline_pass_probe', 'cline_pass_validate', 'cline_pass_test', 'cline_pass_pin', 'cline_pass_accounts', 'cline_pass_history']
   check('every tool is registered', expectedTools.every((toolName) => tools.has(toolName)), [...tools.keys()].join(','))
   check('no extra tools', tools.size === expectedTools.length, [...tools.keys()].join(','))
@@ -1196,6 +1447,8 @@ try {
 }
 
 gateway.close()
+heldGateway.closeAllConnections()
+heldGateway.close()
 
 if (failures.length > 0) {
   console.error(`\n✘ ${failures.length} check(s) failed, ${passed} passed:\n`)

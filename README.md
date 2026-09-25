@@ -68,7 +68,7 @@ cline_pass_accounts action=mode mode=roundrobin
         apiKeyEnv: CLINE_PASS_BACKUP_KEY
 ```
 
-常用设置包括 `baseURL`、`knownModels`、`models`、`perModel`、`exposeCatalog` 和 `historyLimit`。默认网关地址为 `https://api.cline.bot/api/v1`。
+常用设置包括 `baseURL`、`knownModels`、`models`、`perModel`、`exposeCatalog` 和 `historyLimit`。默认网关地址为 `https://api.cline.bot/api/v1`。`maxConcurrentRequests` 限制每个账号同时发往网关的流数，默认 16，超出的请求排队等待空位，设为 `0` 表示不限。
 
 ## 上游渠道
 
