@@ -1,6 +1,6 @@
 {
   "name": "dsh-cline-pass",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Self-contained Cline Pass provider for dsh: register Cline Pass subscription models on the harness LLM seam, enumerate and validate the upstream channels behind each model, pin or exclude them with failover, and drive an account pool. No proxy process and no external cline-pass-switcher install required.",
   "type": "module",
   "main": "lib/index.js",
