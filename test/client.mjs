@@ -360,14 +360,16 @@ check('apply() runs without throwing', applyError === null, applyError?.message 
 
 const keys = registrations.map((registration) => `${registration.options.name}:${registration.options.key ?? registration.options.id ?? ''}`)
 check('every declared slot is registered', registrations.length === 3, keys.join(' '))
-check('a Plugins tab is registered', registrations.some((registration) => registration.options.name === 'settings.plugins.tab' && registration.options.id === 'cline-pass'), keys.join(' '))
+check('a first-level settings section is registered', registrations.some((registration) => registration.options.name === 'settings.section' && registration.options.id === 'cline-pass'), keys.join(' '))
 check('a Models-page card is registered', registrations.some((registration) => registration.options.name === 'settings.models.provider-card' && registration.options.key === 'cline-pass'), keys.join(' '))
-// `settings.plugins.tab` is a list slot ordered by `order`; the host's own
-// inventory tab sits at 10, so the route's tab is placed after it.
-check('the Plugins tab carries an order and a locale label thunk', registrations.find((registration) => registration.options.name === 'settings.plugins.tab')?.options.order === 20 && typeof registrations.find((registration) => registration.options.name === 'settings.plugins.tab')?.options.label === 'function', keys.join(' '))
-// One surface, not two: the panel lives in the Plugins tab alone, so no
-// Settings-nav entry duplicates it.
-check('no Settings page duplicates the Plugins panel', !registrations.some((registration) => registration.options.name === 'settings.section'), keys.join(' '))
+// 12 sits between the shell's own Models (10) and Plugins (15): the pins are what
+// this plugin is for, so they get the same standing as a built-in page.
+check('the section carries its nav position and a locale label thunk', registrations.find((registration) => registration.options.name === 'settings.section')?.options.order === 12 && typeof registrations.find((registration) => registration.options.name === 'settings.section')?.options.label === 'function' && typeof registrations.find((registration) => registration.options.name === 'settings.section')?.options.label() === 'string', keys.join(' '))
+// One surface, not two. The panel used to be a tab under Plugins and nothing else,
+// which is what put a pin five clicks deep; the section replaces it rather than
+// joining it, so the same panel is not offered twice.
+check('the panel is not also offered as a Plugins tab',
+  !registrations.some((registration) => registration.options.name === 'settings.plugins.tab'), keys.join(' '))
 
 // ── the panel's own copy follows the active locale ──────────────────────────
 
@@ -409,7 +411,7 @@ function resolveComponents(node) {
 
 // The Plugins tab is the one configuration surface, and it is a disclosure the
 // stub above opens, so its body — the panel — is what this renders.
-const cardRegistrationForText = registrations.find((registration) => registration.options.name === 'settings.plugins.tab')
+const cardRegistrationForText = registrations.find((registration) => registration.options.name === 'settings.section')
 
 function renderCardText() {
   return collectText(resolveComponents(runComponent(cardRegistrationForText.component, propsFor(cardRegistrationForText)).tree)).join(' ')
@@ -462,7 +464,11 @@ check('a composition without the locale service still renders Chinese', renderCa
   const store = cardRegistrationForText.options.inject().hooks.clinePass
   const snapshot = store.getSnapshot()
   const accounts = [{ key: 'default', displayName: 'Cline Pass', apiKeyEnv: 'CLINE_PASS_API_KEY', enabled: true, declared: true, keyConfigured: true, keyHint: 'sk_liv…3456' }]
-  const models = [{ id: 'cline-pass/glm-5.2', hidden: false, pinned: ['alibaba'], excluded: ['baseten'], upstreams: ['alibaba', 'baseten'], upstreamStatus: [{ upstream: 'alibaba', status: 'ok', note: '' }], targets: ['alibaba'] }]
+  // Two rows, because the wording differs by state: one pinned, one on smart routing.
+  const models = [
+    { id: 'cline-pass/glm-5.2', hidden: false, pinMode: 'strict', pinned: ['alibaba'], excluded: ['baseten'], upstreams: ['alibaba', 'baseten'], upstreamStatus: [{ upstream: 'alibaba', status: 'ok', note: '' }], targets: ['alibaba'] },
+    { id: 'cline-pass/kimi-k3', hidden: false, pinMode: 'strict', pinned: [], excluded: [], upstreams: ['moonshot', 'baseten'], upstreamStatus: [], targets: [] },
+  ]
   const usage = { fetchedAt: Date.now(), accounts: [{ account: 'default', ok: true, limits: [{ type: 'five_hour', percentUsed: 25, resetsAt: new Date(Date.now() + 3_600_000).toISOString() }, { type: 'weekly', percentUsed: 80, resetsAt: new Date(Date.now() + 86_400_000).toISOString() }, { type: 'made_up_window', percentUsed: 5, resetsAt: '' }] }] }
   store.set({
     ...snapshot,
@@ -484,7 +490,130 @@ check('a composition without the locale service still renders Chinese', renderCa
   check('the loaded panel shows the quota percentages', loaded !== null && loaded.includes('25%') && loaded.includes('80%'), (loaded ?? '').slice(0, 200))
   check('the loaded panel names an unknown window verbatim', loaded !== null && loaded.includes('made_up_window'), (loaded ?? '').slice(0, 300))
   check('the loaded panel shows the pinned channel', loaded !== null && loaded.includes('alibaba'), (loaded ?? '').slice(0, 300))
+  // The row answers "what will a request do" without expanding it. It used to read
+  // `已钉住: 自动路由`, asserting a pin over the state where nothing is pinned.
+  {
+    // The exact node text, not a substring: `精确钉住 · alibaba` contains
+    // `钉住 · alibaba`, so an `includes` here would pass with the long wording back.
+    let modeNode = null
+    const walk = (node) => {
+      if (node === null || node === undefined || typeof node !== 'object' || modeNode !== null) return
+      if (Array.isArray(node)) { node.forEach(walk); return }
+      if (String(node.props?.className ?? '').includes('cp-model-mode')) { modeNode = node; return }
+      walk(node.children)
+    }
+    walk(runComponent(cardRegistrationForText.component, propsFor(cardRegistrationForText)).tree)
+    const mode = modeNode === null ? '' : String(modeNode.props.children ?? '')
+    check('a pinned row names its mode and the channel it pins',
+      mode === '钉住 · alibaba', mode)
+  }
+  // The route prefix lives once, in the card header, instead of on every row.
+  check('the card header names the route', loaded !== null && loaded.includes('cline-pass · 2 个模型'), (loaded ?? '').slice(0, 400))
+  // Short in the header, spelled out in its tooltip: the long form was the longest
+  // thing on the line and said the same as two characters.
+  {
+    const surface = cardRegistrationForText.options.inject().hooks.clinePass
+    const before = surface.getSnapshot()
+    surface.set({ ...before, data: { ...before.data, hiddenModels: 17 } })
+    let summary = null
+    const walk = (node) => {
+      if (node === null || node === undefined || typeof node !== 'object' || summary !== null) return
+      if (Array.isArray(node)) { node.forEach(walk); return }
+      // Both cards fold through `foldHeader`, so the models card is the one that
+      // counts models — the accounts card carries a different header.
+      if (String(node.props?.className ?? '').includes('cp-fold')
+        && collectText(node).join('').includes('个模型')) { summary = node; return }
+      walk(node.children)
+    }
+    walk(runComponent(cardRegistrationForText.component, propsFor(cardRegistrationForText)).tree)
+    const header = summary === null ? '' : collectText(summary).join('')
+    check('the header shortens the hidden count',
+      header.includes('cline-pass · 2 个模型 · 17 隐藏'), header.slice(0, 200))
+    check('the long hidden spelling survives as the header tooltip',
+      String(summary?.props?.title ?? '').includes('17 个已从选择列表隐藏'), String(summary?.props?.title))
+    surface.set(before)
+  }
+  {
+    // The visible label loses the prefix; the full id stays in `title` (and in the
+    // checkbox's accessible name), so the row drops noise without losing identity.
+    let nameNode = null
+    const walk = (node) => {
+      if (node === null || node === undefined || typeof node !== 'object' || nameNode !== null) return
+      if (Array.isArray(node)) { node.forEach(walk); return }
+      if (String(node.props?.className ?? '').includes('cp-grow cp-ellipsis')) { nameNode = node; return }
+      walk(node.children)
+    }
+    walk(runComponent(cardRegistrationForText.component, propsFor(cardRegistrationForText)).tree)
+    // `collectText` folds in `title` as well, so the assertion reads the child
+    // itself: that is the only thing a reader sees.
+    const visible = nameNode === null ? '' : String(nameNode.props.children ?? '')
+    check('a row drops the route prefix it shares with every other row',
+      nameNode !== null && visible === 'glm-5.2' && nameNode.props.title === 'cline-pass/glm-5.2',
+      JSON.stringify({ visible, title: nameNode?.props?.title }))
+  }
+  // The count is a hint, not a column: the pinned names already say how many are
+  // pinned, and repeating it pushed the row onto a second line. It survives in the
+  // expander's tooltip.
+  check('a pinned row does not repeat how many channels are pinned',
+    loaded !== null && !loaded.includes('已钉住 1'), (loaded ?? '').slice(0, 400))
+  // Not just "the old exact string is gone": any `已钉住:` prefix is the defect, since
+  // the mode is not a pin and prefixing it claims one.
+  check('an unpinned row says smart routing instead of claiming a pin',
+    loaded !== null && loaded.includes('智能路由')
+      && !loaded.includes('已钉住:') && !loaded.includes('已钉住: 自动路由'), (loaded ?? '').slice(0, 400))
+  // The channel count moved off the row and onto the expander's tooltip, so the row
+  // stays one line whatever the pin order is.
+  {
+    let expander = null
+    const walk = (node) => {
+      if (node === null || node === undefined || typeof node !== 'object' || expander !== null) return
+      if (Array.isArray(node)) { node.forEach(walk); return }
+      if (String(node.props?.title ?? '').includes('个渠道')) { expander = node; return }
+      walk(node.children)
+    }
+    walk(runComponent(cardRegistrationForText.component, propsFor(cardRegistrationForText)).tree)
+    check('the channel count rides on the expander tooltip',
+      expander !== null && String(expander.props.title).includes('2 个渠道'), String(expander?.props?.title))
+  }
   check('the loaded panel leaks no raw key', loaded !== null && !/keyMissing$|\bdata\b:/.test(loaded), (loaded ?? '').slice(0, 200))
+  // The section is the page. It used to fold inside the Plugins tab, where a long
+  // panel had to stay out of the way; as a page of its own the fold only asks for a
+  // click on the thing the user just navigated to.
+  {
+    let folded = null
+    const walk = (node) => {
+      if (node === null || node === undefined || typeof node !== 'object' || folded !== null) return
+      if (Array.isArray(node)) { node.forEach(walk); return }
+      if (String(node.props?.className ?? '').includes('cp-set-header')) { folded = node; return }
+      walk(node.children)
+    }
+    walk(runComponent(cardRegistrationForText.component, propsFor(cardRegistrationForText)).tree)
+    check('the section renders its panel without a second fold', folded === null)
+  }
+  // The bulk toolbar sits directly above the first row, where the card's own gap
+  // reads as none against two stacked borders. The class is what opens it up.
+  {
+    const modelsCard = registrations.length > 0
+      ? runComponent(cardRegistrationForText.component, propsFor(cardRegistrationForText)).tree
+      : null
+    // `details` wraps everything after its summary, so the card's flex gap stops at
+    // that wrapper; the grouping is what separates the toolbar from the first row.
+    check('the models card groups its toolbar and list so the gap applies',
+      JSON.stringify(modelsCard ?? null).includes('cp-models-body'),
+      JSON.stringify(modelsCard ?? null).slice(0, 200))
+    // Open on first render: a collapsed card hides whether anything is pinned, which
+    // is the question this page exists to answer.
+    let fold = null
+    const findFold = (node) => {
+      if (node === null || node === undefined || typeof node !== 'object' || fold !== null) return
+      if (Array.isArray(node)) { node.forEach(findFold); return }
+      if (String(node.props?.className ?? '').includes('cp-models')) { fold = node; return }
+      findFold(node.children)
+    }
+    findFold(modelsCard)
+    check('the models card starts expanded', fold !== null && fold.props.open === true,
+      JSON.stringify(fold?.props?.open))
+  }
 
   // The management-tools switch: a real checkbox, reflecting the stored value
   // and wired to the host action. Its caption is the whole explanation the panel
@@ -549,6 +678,7 @@ check('a composition without the locale service still renders Chinese', renderCa
   }  store.set(snapshot)
 }
 
+
 // ── the user's path: open the tab, let the effects run, show the data ───────
 //
 // This is the sequence that shipped broken. A real mount renders with no data,
@@ -601,7 +731,7 @@ check('a composition without the locale service still renders Chinese', renderCa
   check('the panel re-reads once its data lands', secondPass > 0, String(secondPass))
 
   const settled = collectText(resolveComponents(runComponent(cardRegistrationForText.component, propsFor(cardRegistrationForText)).tree)).join(' ')
-  check('the panel is populated after the reads settle', settled.includes('42%') && settled.includes('cline-pass/glm-5.2'), settled.slice(0, 200))
+  check('the panel is populated after the reads settle', settled.includes('42%') && settled.includes('glm-5.2'), settled.slice(0, 200))
   check('the settled panel renders no raw i18n key', !/\bkeyMissing\b|\bpanelUnavailable\b|\bexpand\b|\bcollapse\b/.test(settled), settled.slice(0, 200))
 
   globalThis.fetch = savedFetch
@@ -729,7 +859,8 @@ function renderWith(primitives, registration) {
   exportsUnderTest.apply(ctx)
   const target = seen.find((entry) => entry.options.name === registration)
   if (target === undefined) return { tree: null, effects: [] }
-  return runComponent(target.component, propsFor(target))
+  const props = propsFor(target)
+  return { ...runComponent(target.component, props), props, target }
 }
 
 for (const [label, names, expected] of [
@@ -744,12 +875,28 @@ for (const [label, names, expected] of [
   const primitives = taggedPrimitives(names, picked)
   let result = null
   try {
-    result = renderWith(primitives, 'settings.plugins.tab')
+    result = renderWith(primitives, 'settings.section')
   } catch (error) {
-    failures.push(`rendering the Plugins tab under ${label} threw: ${error?.message ?? error}`)
+    failures.push(`rendering the section under ${label} threw: ${error?.message ?? error}`)
     continue
   }
-  check(`the Plugins tab renders under ${label}`, result.tree !== null && result.tree !== undefined)
+  check(`the section renders under ${label}`, result.tree !== null && result.tree !== undefined)
+  // The chevron only exists inside a fold header, and the fold cards wait for data.
+  // Populating the shared store and rendering again is what puts one on screen.
+  const surface = result.props?.hooks?.clinePass
+  if (surface !== undefined) {
+    const before = surface.getSnapshot()
+    surface.set({
+      ...before,
+      status: 'ready',
+      data: {
+        provider: 'cline-pass', displayName: 'Cline Pass', ready: true, settingsAvailable: true,
+        accountMode: 'single', activeAccount: '', accounts: [], models: [{ id: 'cline-pass/glm-5.2', hidden: false, pinned: [], excluded: [], upstreams: [] }],
+        pinnedModels: 0, hiddenModels: 0, catalogCount: 0, historySize: 0, usage: null,
+      },
+    })
+    result = { ...runComponent(result.target.component, result.props), props: result.props, target: result.target }
+  }
   // The bundle picks one name at load. Assert it picked the highest-preference
   // one this host publishes, and that an unknown host falls back to the glyph.
   const usedFallback = JSON.stringify(result.tree ?? null).includes('M4 6.5 8 10.5 12 6.5')
@@ -857,8 +1004,8 @@ for (const [label, names, expected] of [
     effect: (body) => { const dispose = body(); return typeof dispose === 'function' ? dispose : () => {} },
     get: (name) => (name === 'slots' ? slots : name === 'connection' ? connectionService : name === 'modelDirectories' ? modelDirectories : undefined),
   })
-  const card = seen.find((entry) => entry.options.name === 'settings.plugins.tab').component
-  const cardProps = propsFor(seen.find((entry) => entry.options.name === 'settings.plugins.tab'))
+  const card = seen.find((entry) => entry.options.name === 'settings.section').component
+  const cardProps = propsFor(seen.find((entry) => entry.options.name === 'settings.section'))
   const render = () => { cursor = 0; return card({ ...cardProps }) }
   const copy = (tree) => collectText(resolveComponents(tree)).join(' ')
   const navButton = (tree, label) => {
@@ -1315,12 +1462,13 @@ for (const [label, names, expected] of [
 
   }
 
+
   store.set(snapshot)
 }
 
 // ── the registration face is live, not a snapshot ───────────────────────────
 
-const faceRegistration = registrations.find((registration) => registration.options.name === 'settings.plugins.tab')
+const faceRegistration = registrations.find((registration) => registration.options.name === 'settings.section')
 const firstFace = propsFor(faceRegistration)
 check('the injected face exposes the store hook', typeof firstFace.useClinePass === 'function')
 const snapshotA = firstFace.useClinePass((value) => value)

@@ -1,61 +1,41 @@
 # dsh-cline-pass
 
-Connect [Cline Pass](https://cline.bot/cline-pass) subscription models to the [DeepSeek Harness](https://github.com/deepseek-ai). Install it as a dsh plugin and the models appear in the model list without running a proxy service.
+[![npm](https://img.shields.io/npm/v/dsh-cline-pass)](https://www.npmjs.com/package/dsh-cline-pass)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
+[中文](README.md) | English
+
+Use [Cline Pass](https://cline.bot/cline-pass) subscription models directly in [DeepSeek Harness (dsh)](https://github.com/deepseek-ai), without running a separate proxy service.
 
 ## Features
 
-- Use Cline Pass subscription models from dsh
-- Streaming, tool calls, image input, and reasoning
-- Multiple accounts with optional round-robin rotation
-- Probe, test, pin, or exclude upstream channels
-- Automatic failover before the first token
-- Web settings panel and `cline_pass_*` tools
+- Streaming, tool calls, image input, and reasoning, depending on the model.
+- Multiple accounts with single-account and round-robin modes.
+- Discover, validate, pin, or exclude upstream channels, with failover before the first token.
+- Web settings panel and optional `cline_pass_*` management tools.
 
-## Requirements
+## Quick start
 
-- dsh `>= 0.1.2-alpha.3 < 0.3.0`
-- Node.js `>= 20.3`
-- A Cline Pass API key
-
-## Install
+Requires Node.js `>= 20.3.0`, dsh `>= 0.1.2-alpha.3 < 0.3.0`, and a valid Cline Pass API key.
 
 ```bash
 dsh plugin --profile web add dsh-cline-pass
 ```
 
-You can also install a local directory or tarball:
+Restart dsh, open **Settings → Cline Pass** to save and test your API key, then select a Cline Pass model in the model picker. Keys are stored in the dsh credential store and displayed only in masked form.
+
+Alternatively, configure the key through an environment variable:
 
 ```bash
-dsh plugin --profile web add /path/to/dsh-cline-pass
-dsh plugin --profile web add ./dsh-cline-pass-<version>.tgz
-```
-
-Restart dsh after installation.
-
-## Configure
-
-With the Web profile, open **Settings → Cline Pass** to save and test a key. Keys are stored in the dsh credential store and shown only in masked form.
-
-You can also set an environment variable before starting dsh:
-
-```bash
-export CLINE_PASS_API_KEY=sk_xxx
+export CLINE_PASS_API_KEY="your-cline-pass-api-key"
 dsh --profile web
 ```
 
-### Multiple accounts
+These commands use the `web` profile; replace the name if you use another profile.
 
-Add accounts in the settings panel and select single-account or round-robin mode. You can also use the tool interface:
+## Configuration
 
-```text
-cline_pass_accounts action=add name=main key=sk_xxx
-cline_pass_accounts action=add name=backup key=sk_yyy
-cline_pass_accounts action=mode mode=roundrobin
-```
-
-### Configuration file
-
-To override defaults, add a `cline-pass` section to your profile's `$DSH_HOME/profiles/<name>/cordis.patch.yml`:
+Use the Web panel for everyday configuration. For file-based configuration, edit your profile's `$DSH_HOME/profiles/<name>/cordis.patch.yml`, for example:
 
 ```yaml
 - id: cline-pass
@@ -66,76 +46,48 @@ To override defaults, add a `cline-pass` section to your profile's `$DSH_HOME/pr
         apiKeyEnv: CLINE_PASS_MAIN_KEY
       backup:
         apiKeyEnv: CLINE_PASS_BACKUP_KEY
+    exposeTools: false
 ```
 
-Common settings include `baseURL`, `knownModels`, `models`, `perModel`, `exposeTools`, `exposeCatalog`, and `historyLimit`. The default gateway is `https://api.cline.bot/api/v1`. `maxConcurrentRequests` caps how many streams each account keeps open to the gateway at once (default 16); further requests wait for a free slot, and `0` lifts the cap.
+Each `apiKeyEnv` refers to a credential name or environment variable; configure a key for each account. Management tools are disabled by default. Set `exposeTools` to `true` and restart dsh to enable them.
 
-### Management tools
-
-The `cline_pass_*` tools are **not registered by default**. Their eight definitions total roughly 5.5k characters of schema and description that ride in every request's tool list, and managing the route is an occasional need, so the default keeps that cost out of every conversation.
-
-Turn them on with **Expose the tools (takes effect after a restart)** in **Settings → Cline Pass**, or in the profile configuration:
-
-```yaml
-- id: cline-pass
-  config:
-    exposeTools: true
-```
-
-**The value is read when the plugin activates, so a change needs a dsh restart** — a tool already registered cannot be pulled back out of a conversation in progress.
-
-The provider route and the setup panel are unaffected — the panel is a browser page rather than a tool, and it stays available with the tools off.
-
-> A profile upgraded from 0.2.1 or earlier has no `exposeTools` key, so it adopts the new default of `false` and its `cline_pass_*` tools stop being registered. The panel reports this; tick the checkbox and restart to bring them back.
+The default gateway is `https://api.cline.bot/api/v1`. Each account allows up to `16` concurrent requests (`maxConcurrentRequests`; `0` removes the limit). See [`lib/index.js`](lib/index.js) for more options and [`lib/tools.js`](lib/tools.js) for management tools.
 
 ## Upstream channels
 
-For a new model, expand its row and click **Probe** to discover channels, then **Validate** to check which channels actually honor a pin. Choose a channel order or exclusions as needed. Validation sends one real request per channel and does not change the stored pin; **Test** checks the saved pin rules.
+Expand a model row in the settings panel, click **Probe → Validate**, save your channel order or exclusions, then click **Test** to verify.
 
-You can also run the tools in this order:
+- `strict`: Restrict each attempt to its specified candidate channel.
+- `preferred`: Send a preferred channel order to the gateway and try subsequent candidates when needed.
 
-```text
-cline_pass_probe    model=cline-pass/glm-5.2
-cline_pass_validate model=cline-pass/glm-5.2
-cline_pass_pin      model=cline-pass/glm-5.2 upstreams=["alibaba","baseten"] pinMode=preferred
-```
+Validation sends real requests to each channel without changing saved rules. Failover for retryable errors takes place before the first output token.
 
-`pinMode` supports `strict` and `preferred`. `preferred` tries channels in order and fails over before the first token when needed. Use `exclude` to block specific channels.
+## Development and contributing
 
-## Tools
-
-| Tool | Purpose |
-| --- | --- |
-| `cline_pass_status` | Show route and account status |
-| `cline_pass_models` | List models and channels |
-| `cline_pass_probe` | Probe channels |
-| `cline_pass_validate` | Test each channel |
-| `cline_pass_test` | Verify the current settings |
-| `cline_pass_pin` | Save channel settings |
-| `cline_pass_accounts` | Manage accounts |
-| `cline_pass_history` | Read request history |
-
-## Development
+The project uses JavaScript ES Modules with no build step. Install dependencies and run:
 
 ```bash
+npm install
 npm test
 npm run test:client
 npm run test:mount
 ```
 
-Live gateway checks are also available:
+Tests require compatible dsh packages; the mount test also requires a complete dsh installation. `npm run test:live`, `npm run test:live:image`, and `npm run test:live:reasoning` access the live gateway, require a valid key, and consume quota or incur charges.
 
-```bash
-npm run test:live
-npm run test:live:image
-npm run test:live:reasoning
-```
-
-These commands need a valid Cline Pass key and make a small number of paid requests.
+[Issues](https://github.com/yhshzh/dsh-cline-pass/issues) and Pull Requests are welcome. Include versions, reproduction steps, and sanitized logs in bug reports, and run relevant tests before submitting code.
 
 ## Acknowledgements
 
 Upstream channel and failover behavior was informed by the MIT-licensed [`cline-pass-switcher`](https://github.com/munmunjaklin458-afk/cline-pass-switcher).
+
+## Community links
+
+[LinuxDo](https://linux.do/) — A community for open source and technology, built on sincerity, kindness, unity, and professionalism.
+
+## Star History
+
+[![Star History Chart](https://api.star-history.com/svg?repos=yhshzh/dsh-cline-pass&type=Date)](https://www.star-history.com/#yhshzh/dsh-cline-pass&Date)
 
 ## License
 

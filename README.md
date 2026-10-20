@@ -1,61 +1,41 @@
 # dsh-cline-pass
 
-将 [Cline Pass](https://cline.bot/cline-pass) 订阅模型接入 [DeepSeek Harness](https://github.com/deepseek-ai)。安装为 dsh 插件后，模型会直接出现在模型列表中，无需运行代理服务。
+[![npm](https://img.shields.io/npm/v/dsh-cline-pass)](https://www.npmjs.com/package/dsh-cline-pass)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
+中文 | [English](README.en.md)
+
+将 [Cline Pass](https://cline.bot/cline-pass) 订阅模型接入 [DeepSeek Harness（dsh）](https://github.com/deepseek-ai)，直接在模型列表中使用，无需部署代理服务。
 
 ## 功能
 
-- 使用 Cline Pass 订阅模型
-- 支持流式输出、工具调用、图片和 reasoning
-- 管理多个账号并轮询使用
-- 探测、测试、钉住或排除上游渠道
-- 在首个 token 前自动故障转移
-- 提供 Web 设置面板和 `cline_pass_*` 工具
+- 支持流式输出、工具调用、图片输入和推理，具体能力取决于模型。
+- 多账号管理，支持单账号与轮询模式。
+- 探测、校验、指定或排除上游渠道，支持首个 token 前的故障转移。
+- 提供 Web 设置面板和可选的 `cline_pass_*` 管理工具。
 
-## 要求
+## 快速开始
 
-- dsh `>= 0.1.2-alpha.3 < 0.3.0`
-- Node.js `>= 20.3`
-- Cline Pass API Key
-
-## 安装
+需要 Node.js `>= 20.3.0`、dsh `>= 0.1.2-alpha.3 < 0.3.0` 和有效的 Cline Pass API Key。
 
 ```bash
 dsh plugin --profile web add dsh-cline-pass
 ```
 
-也可以安装本地目录或 tarball：
+安装后重启 dsh，在 **设置 → Cline Pass** 中保存并测试 API Key，然后在模型选择器中选择 Cline Pass 模型。Key 存入 dsh 凭据库，界面仅显示掩码。
+
+也可以通过环境变量配置：
 
 ```bash
-dsh plugin --profile web add /path/to/dsh-cline-pass
-dsh plugin --profile web add ./dsh-cline-pass-<version>.tgz
-```
-
-安装后重启 dsh。
-
-## 配置
-
-Web profile 可以在 **设置 → Cline Pass** 中保存和测试 Key。Key 会存入 dsh 凭据库，界面只显示掩码。
-
-也可以在启动 dsh 前设置环境变量：
-
-```bash
-export CLINE_PASS_API_KEY=sk_xxx
+export CLINE_PASS_API_KEY="your-cline-pass-api-key"
 dsh --profile web
 ```
 
-### 多账号
+以上使用 `web` profile，如需使用其他 profile，请替换对应名称。
 
-在设置面板中添加账号，并选择单账号或轮询模式。也可以调用工具：
+## 配置
 
-```text
-cline_pass_accounts action=add name=main key=sk_xxx
-cline_pass_accounts action=add name=backup key=sk_yyy
-cline_pass_accounts action=mode mode=roundrobin
-```
-
-### 配置文件
-
-需要覆盖默认值时，在 profile 的 `$DSH_HOME/profiles/<name>/cordis.patch.yml` 中添加：
+日常配置可在 Web 面板完成。通过文件配置时，修改对应 profile 的 `$DSH_HOME/profiles/<name>/cordis.patch.yml`，例如：
 
 ```yaml
 - id: cline-pass
@@ -66,72 +46,36 @@ cline_pass_accounts action=mode mode=roundrobin
         apiKeyEnv: CLINE_PASS_MAIN_KEY
       backup:
         apiKeyEnv: CLINE_PASS_BACKUP_KEY
+    exposeTools: false
 ```
 
-### 管理工具
+`apiKeyEnv` 指向凭据名称或环境变量，请分别配置两个账号的 Key。管理工具默认关闭，需要时将 `exposeTools` 设为 `true`，并重启 dsh。
 
-`cline_pass_*` 工具**默认不注册**。8 个工具定义合计约 5.5k 字符，会出现在每次请求的工具列表里，而管理路由只是偶尔需要，所以默认让所有对话都不必付这份开销。
-
-需要时在**设置 → Cline Pass** 中勾选「开启工具注入（重启后生效）」，或在 profile 配置里打开：
-
-```yaml
-- id: cline-pass
-  config:
-    exposeTools: true
-```
-
-**该值在插件激活时读取，改动后需重启 dsh 才生效** —— 已经注册的工具无法从进行中的对话里撤回。
-
-提供商路由和设置面板不受影响 —— 面板是浏览器页面而非工具，工具关闭时仍然可用。
-
-> 从 0.2.1 及更早版本升级的 profile 里没有 `exposeTools` 键，因此会采用新的默认值 `false`：升级后 `cline_pass_*` 工具将不再注册。面板会提示，勾选该复选框并在重启后恢复。
-
-常用设置包括 `baseURL`、`knownModels`、`models`、`perModel`、`exposeCatalog` 和 `historyLimit`。默认网关地址为 `https://api.cline.bot/api/v1`。`maxConcurrentRequests` 限制每个账号同时发往网关的流数，默认 16，超出的请求排队等待空位，设为 `0` 表示不限。
+默认网关为 `https://api.cline.bot/api/v1`，每个账号的并发请求上限为 `16`（`maxConcurrentRequests`，`0` 表示不限）。更多选项见 [`lib/index.js`](lib/index.js)，管理工具见 [`lib/tools.js`](lib/tools.js)。
 
 ## 上游渠道
 
-首次使用模型时，展开面板中的模型行，先点击 **探测** 获取渠道，再点击 **校验** 检查各渠道是否确实采用了钉住规则，最后按需要选择渠道顺序或排除渠道。校验会向每个渠道发出一次真实请求，不会自动修改钉住配置；**测试** 可验证已保存的钉住规则。
+在设置面板中展开模型行，依次点击 **探测 → 校验**，保存渠道顺序或排除列表后，点击 **测试** 验证。
 
-也可以按以下顺序调用工具：
+- `strict`：每次尝试限制到指定的候选渠道。
+- `preferred`：向网关传递渠道偏好顺序，必要时尝试后续候选渠道。
 
-```text
-cline_pass_probe    model=cline-pass/glm-5.2
-cline_pass_validate model=cline-pass/glm-5.2
-cline_pass_pin      model=cline-pass/glm-5.2 upstreams=["alibaba","baseten"] pinMode=preferred
-```
+校验会向每个渠道发送真实请求，不会修改已保存的规则；可重试的故障转移发生在首个 token 输出前。
 
-`pinMode` 支持 `strict` 和 `preferred`。`preferred` 会按顺序尝试渠道，并在首个 token 前失败时自动切换。`exclude` 可排除指定渠道。
+## 开发与贡献
 
-## 工具
-
-| 工具 | 用途 |
-| --- | --- |
-| `cline_pass_status` | 查看路由和账号状态 |
-| `cline_pass_models` | 查看模型和渠道 |
-| `cline_pass_probe` | 探测渠道 |
-| `cline_pass_validate` | 测试每个渠道 |
-| `cline_pass_test` | 验证当前设置 |
-| `cline_pass_pin` | 保存渠道设置 |
-| `cline_pass_accounts` | 管理账号 |
-| `cline_pass_history` | 查看请求历史 |
-
-## 开发
+项目使用 JavaScript ES Modules，无需编译。安装依赖后运行：
 
 ```bash
+npm install
 npm test
 npm run test:client
 npm run test:mount
 ```
 
-访问真实网关的测试还包括：
+测试需要兼容版本的 dsh 相关包，挂载测试还需要完整的 dsh 安装。`npm run test:live`、`npm run test:live:image` 和 `npm run test:live:reasoning` 会访问真实网关，需要有效 Key 并消耗额度或产生费用。
 
-```bash
-npm run test:live
-npm run test:live:image
-npm run test:live:reasoning
-```
-
-这些命令需要有效的 Cline Pass Key，并会产生少量请求费用。
+欢迎提交 [Issue](https://github.com/yhshzh/dsh-cline-pass/issues) 或 Pull Request。报告问题时请附版本、复现步骤及脱敏日志；提交代码前请运行相关测试。
 
 ## 致谢
 
@@ -141,6 +85,10 @@ npm run test:live:reasoning
 
 [LinuxDo](https://linux.do/) — 真诚、友善、团结、专业，你的品质开源与技术社区
 
-## License
+## Star History
+
+[![Star History Chart](https://api.star-history.com/svg?repos=yhshzh/dsh-cline-pass&type=Date)](https://www.star-history.com/#yhshzh/dsh-cline-pass&Date)
+
+## 许可证
 
 [MIT](LICENSE)
