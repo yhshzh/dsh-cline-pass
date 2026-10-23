@@ -122,7 +122,7 @@ function streamFrames(upstream, pipeline, variant) {
     frames.push({ choices: [{ index: 0, delta: { content: 'OK' } }] })
     frames.push({ choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] })
   }
-  frames.push({ ...routing, choices: [] })
+  if (variant !== 'silent') frames.push({ ...routing, choices: [] })
   frames.push({ usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15, prompt_tokens_details: { cached_tokens: 2 } }, choices: [] })
   return frames
 }
@@ -393,6 +393,23 @@ try {
   check('automatic routing turns excludes into an allow-list', same(autoExclude.providerOptions.gateway, { only: ['a'] }), JSON.stringify(autoExclude))
   check('no pin and no exclusion leaves the body untouched', same(injectPrefs({ model: 'm' }, {}, {}), { model: 'm' }))
 
+  // The capability filter is a routing instruction on its own, and it exists only on
+  // the gateway: OpenRouter has no equivalent, so the direct spelling must not carry a
+  // field that would look active and do nothing.
+  const capWire = injectPrefs({ model: 'm' }, { pipeline: 'planner', upstreams: ['deepseek'] }, buildAttempts({ upstreams: ['deepseek'], pinMode: 'strict', has: ['vision', '!quantization:bf16'] })[0])
+  check('a capability filter rides with the pin on the planner pipeline',
+    same(capWire.providerOptions.gateway, { only: ['deepseek'], has: ['vision', '!quantization:bf16'] }), JSON.stringify(capWire))
+  const capWireOnly = injectPrefs({ model: 'm' }, { pipeline: 'planner' }, buildAttempts({ has: ['vision'] })[0])
+  check('a capability filter applies without a pin',
+    same(capWireOnly.providerOptions, { gateway: { has: ['vision'] } }), JSON.stringify(capWireOnly))
+  // Both spellings are written by default, because the pipeline a model runs on is
+  // decided per call: the gateway spelling rides along even when the last probe saw a
+  // direct model, and OpenRouter ignores the field it does not read.
+  const capWireDirect = injectPrefs({ model: 'm' }, { pipeline: 'direct', upstreams: ['deepseek'] }, buildAttempts({ upstreams: ['deepseek'], has: ['vision'] })[0])
+  check('the capability filter is written in the gateway spelling whatever was probed',
+    same(capWireDirect.providerOptions.gateway, { only: ['deepseek'], has: ['vision'] })
+      && same(capWireDirect.provider.only, ['deepseek']), JSON.stringify(capWireDirect))
+
   check('strict candidates expand in order', same(buildAttempts({ upstreams: ['a', 'b'], pinMode: 'strict' }).map((attempt) => attempt.upstream), ['a', 'b']))
   check('excluded candidates are dropped from the chain', same(buildAttempts({ upstreams: ['a', 'b'], exclude: ['a'] }).map((attempt) => attempt.upstream), ['b']))
   check('an empty pin is one automatic candidate', same(buildAttempts({ upstreams: [], exclude: ['a'] }), [{ strict: true, sort: null, excludeList: ['a'], upstream: null, orderRest: [] }]))
@@ -499,6 +516,39 @@ try {
   check('the call records the reasoning effort it ran at', typeof plain.records[0].effort === 'string', JSON.stringify(plain.records[0].effort))
   check('the request carried the pinned model and stream flag', stub.requests.at(-1).model === 'cline-pass/glm-5.2' && stub.requests.at(-1).stream === true)
   check('the system prompt and tool schema reached the wire', stub.requests.at(-1).messages[0].role === 'system' && stub.requests.at(-1).tools[0].function.name === 'echo')
+
+  // The column names the upstream the gateway served, not the one the pin asked for:
+  // a gateway that ignores the pin is exactly the case it has to expose.
+  {
+    const driftedStore = createStore({ historyLimit: 10 })
+    driftedStore.learn('cline-pass/glm-5.2', { pipeline: 'planner', upstreams: ['alibaba', 'baseten'], pinnable: true })
+    stub.ignorePins = true
+    stub.servedBy = 'deepseek'
+    const drifted = adapterFor({ store: driftedStore, pin: () => ({ upstreams: ['baseten'], pinMode: 'strict' }) })
+    try {
+      await collect(drifted.adapter, { provider: 'cline-pass', model: 'cline-pass/glm-5.2', messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }] })
+    } finally {
+      stub.ignorePins = false
+    }
+    check('the history records the served upstream, not the pinned one',
+      drifted.records[0]?.provider === 'deepseek', JSON.stringify(drifted.records))
+  }
+  // And when the gateway reports no routing at all, the column stays empty instead of
+  // echoing the pin back as if it had been adopted.
+  {
+    const silentStore = createStore({ historyLimit: 10 })
+    silentStore.learn('cline-pass/glm-5.2', { pipeline: 'planner', upstreams: ['alibaba', 'baseten'], pinnable: true })
+    stub.stream = 'silent'
+    const silent = adapterFor({ store: silentStore, pin: () => ({ upstreams: ['baseten'], pinMode: 'strict' }) })
+    try {
+      await collect(silent.adapter, { provider: 'cline-pass', model: 'cline-pass/glm-5.2', messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }] })
+    } finally {
+      stub.stream = 'tool-call'
+    }
+    check('an unreported routing records no provider at all',
+      silent.records[0]?.provider === null, JSON.stringify(silent.records))
+  }
+
 
   stub.stream = 'reasoning'
   const reasoning = await collect(plain.adapter, {
@@ -1529,9 +1579,19 @@ try {
   await panel['account.mode']({ mode: 'single' })
 
   const panelPinned = await panel['model.pin']({ model: 'cline-pass/glm-5.2', upstreams: ['alibaba', 'baseten'], pinMode: 'preferred', sort: 'ttft' })
-  check('model.pin persists the pin', same(section.perModel['cline-pass/glm-5.2'], { upstreams: ['alibaba', 'baseten'], exclude: [], pinMode: 'preferred', sort: 'ttft' }), JSON.stringify(section.perModel))
+  check('model.pin persists the pin', same(section.perModel['cline-pass/glm-5.2'], { upstreams: ['alibaba', 'baseten'], exclude: [], pinMode: 'preferred', sort: 'ttft', has: [] }), JSON.stringify(section.perModel))
+
   const panelRepinned = await panel['model.pin']({ model: 'cline-pass/glm-5.2', exclude: ['baseten'] })
   check('model.pin keeps the fields it was not given', same(panelRepinned.pin.upstreams, ['alibaba', 'baseten']) && same(panelRepinned.pin.exclude, ['baseten']), JSON.stringify(panelRepinned.pin))
+
+  // Trimmed, de-duplicated, and kept when a later write does not mention it. Written
+  // after the assertion above, because it rewrites the same model's pin.
+  const panelCapped = await panel['model.pin']({ model: 'cline-pass/glm-5.2', has: [' vision ', 'vision', '', '!quantization:bf16'] })
+  check('model.pin normalizes the capability filter',
+    same(panelCapped.pin.has, ['vision', '!quantization:bf16']) && same(section.perModel['cline-pass/glm-5.2'].has, ['vision', '!quantization:bf16']),
+    JSON.stringify(panelCapped.pin.has))
+  const panelKeptHas = await panel['model.pin']({ model: 'cline-pass/glm-5.2', pinMode: 'preferred' })
+  check('model.pin keeps the capability filter it was not given', same(panelKeptHas.pin.has, ['vision', '!quantization:bf16']), JSON.stringify(panelKeptHas.pin))
 
   const panelProbe = await panel['model.probe']({ model: 'cline-pass/glm-5.2' })
   check('model.probe reports the pipeline and channels', panelProbe.result.ok === true && panelProbe.result.pipeline === 'planner' && panelProbe.result.upstreams.length === 2, JSON.stringify(panelProbe.result.upstreams))

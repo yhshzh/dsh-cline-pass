@@ -613,6 +613,52 @@ check('a composition without the locale service still renders Chinese', renderCa
     findFold(modelsCard)
     check('the models card starts expanded', fold !== null && fold.props.open === true,
       JSON.stringify(fold?.props?.open))
+  // ── the channel list is editable, not just what a probe returned ──────────
+  //
+  // An account whose probe came back empty used to be a dead end: the row said no
+  // channels were probed and offered no way to name the upstream the user knew
+  // served them. The list is the user's data now.
+  {
+    const store = cardRegistrationForText.options.inject().hooks.clinePass
+    const base = store.getSnapshot()
+    const row = (pinned) => ({
+      id: 'cline-pass/glm-5.2', hidden: false, pinMode: 'strict',
+      pinned, excluded: [], upstreams: [], upstreamStatus: [], has: [], pipeline: 'planner',
+    })
+    const tree = () => runComponent(cardRegistrationForText.component, propsFor(cardRegistrationForText)).tree
+    const find = (predicate) => {
+      let found = null
+      const walk = (node) => {
+        if (node === null || node === undefined || typeof node !== 'object' || found !== null) return
+        if (Array.isArray(node)) { node.forEach(walk); return }
+        if (predicate(node)) { found = node; return }
+        walk(node.children)
+      }
+      walk(tree())
+      return found
+    }
+
+    store.set({ ...base, status: 'ready', data: { ...base.data, models: [row([])] } })
+    const input = find((node) => node.tag === 'input' && String(node.props?.placeholder ?? '').includes('渠道名'))
+    check('a model with nothing probed still offers a channel input', input !== null)
+    check('the input accepts a typed name', typeof input?.props?.onChange === 'function' && typeof input?.props?.onKeyDown === 'function')
+
+    // A name typed by hand has no probe behind it and must still render, or it could
+    // never be removed.
+    store.set({ ...base, status: 'ready', data: { ...base.data, models: [row(['deepseek'])] } })
+    const chip = find((node) => node.tag === 'span' && String(node.props?.className ?? '') === 'cp-chip cp-chip-on cp-chip-manual')
+    check('a hand-typed channel renders as an unverified chip', chip !== null, JSON.stringify(chip?.props?.className))
+    // It has no discovery list to fall back on, so it needs its own way out.
+    const remove = find((node) => node.props?.title === 'remove' && typeof node.props?.onClick === 'function')
+    check('a hand-typed channel can be removed, not only un-pinned', remove !== null)
+
+    // A probed channel keeps its entry whether pinned or not, so it gets no remove.
+    store.set({ ...base, status: 'ready', data: { ...base.data, models: [{ ...row([]), upstreams: ['deepseek'] }] } })
+    check('a probed channel offers no remove control',
+      find((node) => node.props?.title === 'remove') === null)
+
+    store.set(base)
+  }
   }
 
   // The management-tools switch: a real checkbox, reflecting the stored value
