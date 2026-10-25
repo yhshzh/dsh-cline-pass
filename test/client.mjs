@@ -277,10 +277,14 @@ const slotsService = {
 }
 
 const rpcCalls = []
+// The `history` endpoint answers with a fixture the cache-hit test sets; every other
+// endpoint answers with the panel state.
+let rpcHistory = { entries: [], total: 0 }
 const connectionService = {
   rpc: {
     async call(channel, endpoint, payload) {
       rpcCalls.push({ channel, endpoint, payload })
+      if (endpoint === 'history') return { ok: true, value: rpcHistory }
       return { ok: true, value: { provider: 'cline-pass', displayName: 'Cline Pass', baseURL: 'https://api.cline.bot/api/v1', settingsAvailable: true, accountMode: 'single', activeAccount: '', ready: true, accounts: [{ key: 'default', displayName: 'Cline Pass', apiKeyEnv: 'CLINE_PASS_API_KEY', enabled: true, keyConfigured: true, keyHint: 'sk_liv…3456' }], models: [], pinnedModels: 0, catalogCount: 0, historySize: 0 } }
     },
   },
@@ -656,6 +660,18 @@ check('a composition without the locale service still renders Chinese', renderCa
     store.set({ ...base, status: 'ready', data: { ...base.data, models: [{ ...row([]), upstreams: ['deepseek'] }] } })
     check('a probed channel offers no remove control',
       find((node) => node.props?.title === 'remove') === null)
+
+    // The output budget is one route-wide number, and the card says which one is in
+    // force rather than leaving it to be inferred from the highlighted button.
+    store.set({ ...base, status: 'ready', data: { ...base.data, defaultMaxTokens: 131072 } })
+    const budgetTitle = find((node) => String(node.props?.className ?? '') === 'cp-card-title' && String(node.props?.children ?? '').includes('输出预算'))
+    check('the panel shows the output budget it is running',
+      budgetTitle !== null && String(budgetTitle.props.children).includes('131,072'), String(budgetTitle?.props?.children))
+    const pressed = find((node) => String(node.props?.className ?? '') === 'cp-btn cp-btn-on')
+    check('the active budget preset is marked as pressed',
+      pressed !== null && String(pressed.props.children).includes('128K'), JSON.stringify(pressed?.props?.children))
+
+
 
     store.set(base)
   }
@@ -1091,7 +1107,10 @@ for (const [label, names, expected] of [
   const quota = (text) => {
     const from = text.indexOf('官方额度')
     if (from < 0) return ''
-    const to = text.indexOf('订阅模型', from)
+    // The models card's header is the region's end. It used to read 订阅模型, which is
+    // why this marker went stale the release that header was shortened: the slice ran
+    // to the end of the panel and picked up every later card.
+    const to = text.indexOf('cline-pass', from)
     return text.slice(from, to < 0 ? undefined : to)
   }
   const next = '下一个账号'

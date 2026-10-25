@@ -79,9 +79,12 @@ function routingError(upstreams) {
 
 /** The SSE frames of one successful stream. */
 function streamFrames(upstream, pipeline, variant) {
-  const routing = pipeline === 'planner'
-    ? { provider_metadata: { gateway: { routing: { finalProvider: upstream, canonicalSlug: 'z-ai/glm-5.2', fallbacksAvailable: ['baseten'], planningReasoning: 'alibaba won tier 0 over baseten' } } } }
-    : { provider: upstream, model: 'z-ai/glm-5.2' }
+  // The streaming shape: the gateway attaches routing to `choices[0].delta`, not to a
+  // top-level field. A stub that emitted the non-streaming shape let a parser that only
+  // read `message` pass every test while recording no upstream in production.
+  const routingFrame = pipeline === 'planner'
+    ? { choices: [{ index: 0, delta: { provider_metadata: { gateway: { routing: { finalProvider: upstream, canonicalSlug: 'z-ai/glm-5.2', fallbacksAvailable: ['baseten'], planningReasoning: 'alibaba won tier 0 over baseten' } } } } }] }
+    : { provider: upstream, model: 'z-ai/glm-5.2', choices: [] }
   const frames = []
   if (variant === 'tool-call') {
     frames.push({ choices: [{ index: 0, delta: { content: 'Hel' } }] })
@@ -122,7 +125,7 @@ function streamFrames(upstream, pipeline, variant) {
     frames.push({ choices: [{ index: 0, delta: { content: 'OK' } }] })
     frames.push({ choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] })
   }
-  if (variant !== 'silent') frames.push({ ...routing, choices: [] })
+  if (variant !== 'silent') frames.push(routingFrame)
   frames.push({ usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15, prompt_tokens_details: { cached_tokens: 2 } }, choices: [] })
   return frames
 }
@@ -461,6 +464,11 @@ try {
   })())
 
   check('routing is read from planner metadata', parseRouting({ provider_metadata: { gateway: { routing: { finalProvider: 'alibaba', canonicalSlug: 'z-ai/glm-5.2' } } } }).pipeline === 'planner')
+  // A streamed answer puts the same object on the delta. Reading only the message made
+  // every streamed request record no upstream at all.
+  check('routing on a streamed delta is read too',
+    parseRouting({ choices: [{ delta: { provider_metadata: { gateway: { routing: { finalProvider: 'deepseek', canonicalSlug: 'deepseek/deepseek-v4.1-flash-1017' } } } } }] }).finalProvider === 'deepseek',
+    'delta shape')
   check('routing is read from a direct provider field', parseRouting({ provider: 'GMICloud', model: 'z-ai/glm-5.2', choices: [{ message: { content: 'hi' } }] }).pipeline === 'direct')
   check('an enveloped answer is unwrapped', parseRouting({ data: { provider: 'GMICloud', choices: [{ message: { content: 'hi' } }] } }).finalProvider === 'gmicloud')
   check('classify: rate limit', classifyUpstreamError('429 Too Many Requests') === 'limited')
@@ -1354,6 +1362,20 @@ try {
     check('a budget hand-set past half the window is pulled back to it',
       guarded.defaultMaxTokens === Math.floor(MODEL_CATALOG['cline-pass/kimi-k2.6'].contextWindow / 2), String(guarded.defaultMaxTokens))
 
+    // The shipped default follows the window rather than being applied flat: a 128k
+    // reserve on a 256k window leaves almost nothing to compact into, and on the 128k
+    // fallback window the harness refuses the request outright.
+    const onWindow = (window) => resolveModelMetadata('cline-pass', 'x', emptyOverride, { contextWindow: window, maxTokens: DEFAULT_MAX_TOKENS, reasoning: true }, {}).defaultMaxTokens
+    const onConfigured = (window, configured) => resolveModelMetadata('cline-pass', 'x', emptyOverride, { contextWindow: window, maxTokens: configured, reasoning: true }, {}).defaultMaxTokens
+    check('the shipped output budget is 128k', DEFAULT_MAX_TOKENS === 131072, String(DEFAULT_MAX_TOKENS))
+    check('a 1M window keeps the whole shipped budget', onWindow(1048576) === DEFAULT_MAX_TOKENS, String(onWindow(1048576)))
+    check('a 256k window gets an eighth of it', onWindow(262144) === Math.floor(262144 / 8), String(onWindow(262144)))
+    check('the fallback window still leaves room to compact into',
+      onWindow(128000) === Math.floor(128000 / 8) && 128000 - onWindow(128000) - COMPACTION_HEADROOM > 0,
+      String(onWindow(128000)))
+    // A configured value is a choice, so it is only held back from reserving the window.
+    check('a configured value is not scaled down to an eighth', onConfigured(1048576, 384000) === 384000, String(onConfigured(1048576, 384000)))
+
     const ratios = Object.keys(MODEL_CATALOG).map((id) => {
       const entry = resolveModelMetadata('cline-pass', id, emptyOverride, { ...fallback, maxTokens: DEFAULT_MAX_TOKENS })
       const window = entry.context.contextWindow
@@ -1592,6 +1614,38 @@ try {
     JSON.stringify(panelCapped.pin.has))
   const panelKeptHas = await panel['model.pin']({ model: 'cline-pass/glm-5.2', pinMode: 'preferred' })
   check('model.pin keeps the capability filter it was not given', same(panelKeptHas.pin.has, ['vision', '!quantization:bf16']), JSON.stringify(panelKeptHas.pin))
+
+  // The output budget is one number for the whole route, and the panel refuses a value
+  // that cannot be one rather than writing it.
+  const panelBudget = await panel['budget.set']({ value: 256000 })
+  check('budget.set persists the output budget',
+    Number(section.defaultMaxTokens) === 256000 && Number(panelBudget.defaultMaxTokens) === 256000,
+    JSON.stringify({ stored: section.defaultMaxTokens, reply: panelBudget.defaultMaxTokens }))
+  let budgetRefusal = null
+  try {
+    await panel['budget.set']({ value: 12 })
+  } catch (error) {
+    budgetRefusal = String(error?.message ?? error)
+  }
+  check('budget.set refuses a value too small to be a budget',
+    budgetRefusal !== null && Number(section.defaultMaxTokens) === 256000, String(budgetRefusal))
+
+  // Each history row carries its own cache-hit rate: cache reads over billed prompt
+  // tokens. A request the gateway never reported usage for has no rate at all, which is
+  // not the same as 0%.
+  {
+    const historyStore = createStore({ historyLimit: 10 })
+    const historyPanel = createPanel({ control: panelControl, engine: panelEngine, store: historyStore })
+    historyStore.record({ model: 'cline-pass/glm-5.2', provider: 'deepseek', ms: 10, usage: { inputTokens: 50, outputTokens: 5, cacheReadTokens: 50 } })
+    historyStore.record({ model: 'cline-pass/glm-5.2', provider: 'deepseek', ms: 10, usage: { inputTokens: 100, outputTokens: 5, cacheReadTokens: 0 } })
+    historyStore.record({ model: 'cline-pass/glm-5.2', provider: 'deepseek', ms: 10, usage: null })
+    // A ratio that does not land on a whole percent, so the precision is load-bearing:
+    // rounding to an integer would report this one as 33%.
+    historyStore.record({ model: 'cline-pass/glm-5.2', provider: 'deepseek', ms: 10, usage: { inputTokens: 2, outputTokens: 5, cacheReadTokens: 1 } })
+    const rows = (await historyPanel.history({ limit: 10 })).entries
+    check('the history reports a cache-hit rate per request',
+      same(rows.map((row) => row.cacheHit), [33.33, null, 0, 50]), JSON.stringify(rows.map((row) => row.cacheHit)))
+  }
 
   const panelProbe = await panel['model.probe']({ model: 'cline-pass/glm-5.2' })
   check('model.probe reports the pipeline and channels', panelProbe.result.ok === true && panelProbe.result.pipeline === 'planner' && panelProbe.result.upstreams.length === 2, JSON.stringify(panelProbe.result.upstreams))
