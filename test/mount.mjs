@@ -425,6 +425,31 @@ try {
     afterState.json?.value?.exposeTools === false,
     JSON.stringify(afterState.json?.value?.exposeTools))
 
+  // ── the output budget writes ────────────────────────────────────────────────
+  //
+  // Same refusal as the switch above, and the same reason this cannot be a stub: the
+  // real settings service rejects a write to a field the schema does not mark live,
+  // while every stub accepts it. A card that only looked clickable would pass all of
+  // them.
+  const budgetResponse = await panelPost(envelope('budget.set', { value: 256000 }), cookie)
+  check('the output budget writes through the real settings service',
+    budgetResponse.status === 200 && budgetResponse.json?.ok === true,
+    `HTTP ${budgetResponse.status} — ${budgetResponse.text.slice(0, 300)}`)
+  const budgetWrite = [
+    join(scratch, 'settings.yaml'),
+    join(profileDir, 'cordis.patch.yml'),
+  ].filter((path) => existsSync(path)).map((path) => readFileSync(path, 'utf8'))
+  check('the output budget reaches the settings document',
+    budgetWrite.some((text) => /defaultMaxTokens:\s*256000/.test(text)),
+    budgetWrite.map((text) => text.slice(0, 200)).join(' | '))
+  const budgetState = await panelPost(envelope('state'), cookie)
+  check('the budget card keeps the value it was just given',
+    budgetState.json?.value?.defaultMaxTokens === 256000,
+    JSON.stringify(budgetState.json?.value?.defaultMaxTokens))
+  const budgetBad = await panelPost(envelope('budget.set', { value: 12 }), cookie)
+  check('an impossible output budget is refused rather than written',
+    budgetBad.json?.ok === false, budgetBad.text.slice(0, 200))
+
   // ── removing an account actually removes it ───────────────────────────────
   //
   // Adding a second account and then deleting it is the only way to see whether
