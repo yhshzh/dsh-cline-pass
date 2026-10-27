@@ -1056,6 +1056,46 @@ try {
   check('test reports a single attempt', tested.trace.length === 1, JSON.stringify(tested.trace))
   check("test surfaces the router's own account of the decision", /won tier 0/.test(tested.plan), tested.plan)
 
+  // A capability filter is part of the pin, so every diagnostic call has to carry it.
+  // Probe, pin test and per-channel validation each hand-built their routing options
+  // and all three left it out, which made them measure a different request from the
+  // one the panel showed.
+  {
+    const savedPerModel = section.perModel
+    section = { ...section, perModel: { ...(savedPerModel ?? {}), 'cline-pass/glm-5.2': { upstreams: ['deepseek'], exclude: [], pinMode: 'strict', sort: '', has: ['vision', 'implicit-caching'] } } }
+    try {
+      stub.requests.length = 0
+      await call('cline_pass_test', { model: 'cline-pass/glm-5.2' })
+      const pinTest = stub.requests.find((body) => body.max_tokens === 256) ?? {}
+      check('a pin test carries the filter and the pinned channel',
+        same(pinTest.providerOptions?.gateway?.has, ['vision', 'implicit-caching'])
+          && same(pinTest.providerOptions?.gateway?.only, ['deepseek']),
+        JSON.stringify(pinTest.providerOptions))
+
+      stub.requests.length = 0
+      await call('cline_pass_probe', { model: 'cline-pass/glm-5.2' })
+      const probeBody = stub.requests.find((body) => body.max_tokens === 256) ?? {}
+      const harvestBody = stub.requests.find((body) => same(body.providerOptions?.gateway?.only, ['__probe__'])) ?? {}
+      check('a probe carries the filter but pins no channel',
+        same(probeBody.providerOptions?.gateway?.has, ['vision', 'implicit-caching'])
+          && probeBody.providerOptions?.gateway?.only === undefined,
+        JSON.stringify(probeBody.providerOptions))
+      check('the probe channel query carries the same filter',
+        same(harvestBody.providerOptions?.gateway?.has, ['vision', 'implicit-caching']),
+        JSON.stringify(harvestBody.providerOptions))
+
+      stub.requests.length = 0
+      await call('cline_pass_validate', { model: 'cline-pass/glm-5.2' })
+      const channelBodies = stub.requests.filter((body) => body.max_tokens === 16 && Array.isArray(body.providerOptions?.gateway?.only))
+      check('per-channel validation carries the filter',
+        channelBodies.length > 0
+          && channelBodies.every((body) => same(body.providerOptions?.gateway?.has, ['vision', 'implicit-caching'])),
+        JSON.stringify(channelBodies.map((body) => body.providerOptions?.gateway)))
+    } finally {
+      section = { ...section, perModel: savedPerModel }
+    }
+  }
+
   const pinned = await call('cline_pass_pin', { model: 'cline-pass/glm-5.2', upstreams: ['baseten', 'alibaba'], pinMode: 'preferred', sort: 'cost' })
   check('pin persists into the settings section', same(section.perModel['cline-pass/glm-5.2'], { upstreams: ['baseten', 'alibaba'], exclude: [], pinMode: 'preferred', sort: 'cost' }), JSON.stringify(section.perModel))
   check('pin reports what it stored', pinned.pinned.join() === 'baseten,alibaba' && pinned.sort === 'cost', JSON.stringify(pinned))
