@@ -91,4 +91,20 @@ Upstream channel and failover behavior was informed by the MIT-licensed [`cline-
 
 ## License
 
+### Optional private-provider region restriction
+
+The model's upstream settings offer a **Private provider region** selector (Off / US / EU).
+The per-model configuration field is `privateProviderRegion: us` (or `eu`). It restricts
+only `openai-compatible-private`; all other providers retain global scope. It does not
+claim US/EU inference for DeepSeek or guarantee that the private route will be excluded.
+The default is off, and resetting the model clears this restriction.
+
+For example, combine `upstreams: [deepseek]`, `pinMode: strict` and
+`privateProviderRegion: us` under `perModel.cline-pass/deepseek-v4.1-flash-1017`.
+Chat, probe, test and validation all carry the region restriction. Discovery does not
+restrict itself to the saved pin. A gateway check on 2026-11-05 skipped the private
+route and adopted the DeepSeek pin. Recheck the actual provider and an invalid-provider
+negative control; an HTTP 200 can still contain an SSE error. Discovered channels are
+candidates, not confirmed availability.
+
 [MIT](LICENSE)

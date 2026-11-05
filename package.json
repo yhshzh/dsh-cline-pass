@@ -18,7 +18,7 @@
     "LICENSE"
   ],
   "scripts": {
-    "test": "node test/smoke.mjs && node test/client.mjs && node test/pin-adherence.mjs && node test/account-failover.mjs && node test/review-regressions.mjs",
+    "test": "node test/smoke.mjs && node test/client.mjs && node test/pin-adherence.mjs && node test/account-failover.mjs && node test/review-regressions.mjs && node test/private-region.mjs",
     "test:protocol": "node test/pin-adherence.mjs",
     "test:client": "node test/client.mjs",
     "test:mount": "node test/mount.mjs",
