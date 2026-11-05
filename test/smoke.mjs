@@ -1641,7 +1641,7 @@ try {
   await panel['account.mode']({ mode: 'single' })
 
   const panelPinned = await panel['model.pin']({ model: 'cline-pass/glm-5.2', upstreams: ['alibaba', 'baseten'], pinMode: 'preferred', sort: 'ttft' })
-  check('model.pin persists the pin', same(section.perModel['cline-pass/glm-5.2'], { upstreams: ['alibaba', 'baseten'], exclude: [], pinMode: 'preferred', sort: 'ttft', has: [] }), JSON.stringify(section.perModel))
+  check('model.pin persists the pin', same(section.perModel['cline-pass/glm-5.2'], { upstreams: ['alibaba', 'baseten'], exclude: [], pinMode: 'preferred', sort: 'ttft', has: [], privateProviderRegion: '' }), JSON.stringify(section.perModel))
 
   const panelRepinned = await panel['model.pin']({ model: 'cline-pass/glm-5.2', exclude: ['baseten'] })
   check('model.pin keeps the fields it was not given', same(panelRepinned.pin.upstreams, ['alibaba', 'baseten']) && same(panelRepinned.pin.exclude, ['baseten']), JSON.stringify(panelRepinned.pin))

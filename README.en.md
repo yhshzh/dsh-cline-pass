@@ -62,6 +62,21 @@ Expand a model row in the settings panel, click **Probe → Validate**, save you
 
 Validation sends real requests to each channel without changing saved rules. Failover for retryable errors takes place before the first output token.
 
+### Private provider region
+
+Cline Pass sometimes routes a request through the private virtual channel `openai-compatible-private`, which does not adopt the requested upstream. Pick US or EU in the model's upstream settings — both have the same effect — and that channel drops out of routing, so the `only` pin takes effect. Off by default.
+
+```yaml
+perModel:
+  cline-pass/deepseek-v4.1-flash-1017:
+    upstreams: [deepseek]
+    pinMode: strict
+    privateProviderRegion: us
+```
+
+Chat, probe, test and validation all carry it; resetting the model clears it.
+
+
 ## Development and contributing
 
 The project uses JavaScript ES Modules with no build step. Install dependencies and run:
@@ -90,21 +105,5 @@ Upstream channel and failover behavior was informed by the MIT-licensed [`cline-
 [![Star History Chart](https://api.star-history.com/svg?repos=yhshzh/dsh-cline-pass&type=Date)](https://www.star-history.com/#yhshzh/dsh-cline-pass&Date)
 
 ## License
-
-### Optional private-provider region restriction
-
-The model's upstream settings offer a **Private provider region** selector (Off / US / EU).
-The per-model configuration field is `privateProviderRegion: us` (or `eu`). It restricts
-only `openai-compatible-private`; all other providers retain global scope. It does not
-claim US/EU inference for DeepSeek or guarantee that the private route will be excluded.
-The default is off, and resetting the model clears this restriction.
-
-For example, combine `upstreams: [deepseek]`, `pinMode: strict` and
-`privateProviderRegion: us` under `perModel.cline-pass/deepseek-v4.1-flash-1017`.
-Chat, probe, test and validation all carry the region restriction. Discovery does not
-restrict itself to the saved pin. A gateway check on 2026-11-05 skipped the private
-route and adopted the DeepSeek pin. Recheck the actual provider and an invalid-provider
-negative control; an HTTP 200 can still contain an SSE error. Discovered channels are
-candidates, not confirmed availability.
 
 [MIT](LICENSE)

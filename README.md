@@ -62,31 +62,22 @@ dsh --profile web
 
 校验会向每个渠道发送真实请求，不会修改已保存的规则；可重试的故障转移发生在首个 token 输出前。
 
-## 开发与贡献
+### 私有渠道区域限制
 
-### 私有渠道区域限制（可选）
-
-展开模型的上游设置，在“私有渠道区域限制”中选择 US 或 EU。默认关闭。
-该选项只向 `openai-compatible-private` 添加区域约束，其他上游保持 global；
-不代表 DeepSeek 的推理发生在 US/EU，也不保证永久排除私有渠道。
-
-例如，指定 DeepSeek 并限制私有渠道区域：
+Cline Pass 有时会把请求交给私有虚拟渠道 `openai-compatible-private`，它不采纳指定的上游。在模型的上游设置里选择 US 或 EU（两者效果相同），该渠道就会退出路由，`only` 指定的上游随之生效。默认关闭。
 
 ```yaml
-- id: cline-pass
-  config:
-    perModel:
-      cline-pass/deepseek-v4.1-flash-1017:
-        upstreams: [deepseek]
-        pinMode: strict
-        privateProviderRegion: us
+perModel:
+  cline-pass/deepseek-v4.1-flash-1017:
+    upstreams: [deepseek]
+    pinMode: strict
+    privateProviderRegion: us
 ```
 
-该条件同时用于实际聊天、探测、测试和校验。探测不限制到已指定的渠道，
-但保留区域条件；关闭该选项或重置模型即可移除区域限制。
-2026-11-05 的一次网关实测中，此条件使私有路径退出，随后 `only: [deepseek]`
-生效。请用测试返回的实际渠道确认，并将 `only` 改为不存在的渠道做失败对照；
-HTTP 200 仍可能在 SSE 中携带错误。候选渠道列表不代表全部可用。
+该条件同时用于探测、测试和校验；重置模型会一并清除。
+
+
+## 开发与贡献
 
 项目使用 JavaScript ES Modules，无需编译。安装依赖后运行：
 
